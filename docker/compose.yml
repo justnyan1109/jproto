@@ -1,0 +1,66 @@
+# Тестовая сеть jproto: 3 федерации (ноды) в контейнерах, клиенты — с хоста.
+# Каждый узел = beacon + mix + Local BS + Global BS.
+# Wire TCP порты на хосте 9101-9103, HTTP 9201-9203. Внутренняя сеть jpnet.
+
+services:
+  fedA:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.node
+    image: jproto-node:dev
+    networks: [jpnet]
+    volumes:
+      - ../build:/app/build:ro            # libjppow.so (+ src если понадобится)
+      - jp-data-a:/data
+    environment:
+      JP_NAME: fedA
+      JP_PORT: "9100"
+      JP_HTTP_PORT: "9200"
+      JP_POW_LIB: /app/build/libjppow.so
+      JP_PEERS: "fedB:9100,fedC:9100"
+    ports:
+      - "9101:9100"
+      - "9201:9200"
+
+  fedB:
+    image: jproto-node:dev
+    depends_on: [fedA]
+    networks: [jpnet]
+    volumes:
+      - ../build:/app/build:ro
+      - jp-data-b:/data
+    environment:
+      JP_NAME: fedB
+      JP_PORT: "9100"
+      JP_HTTP_PORT: "9200"
+      JP_POW_LIB: /app/build/libjppow.so
+      JP_PEERS: "fedA:9100,fedC:9100"
+    ports:
+      - "9102:9100"
+      - "9202:9200"
+
+  fedC:
+    image: jproto-node:dev
+    depends_on: [fedA]
+    networks: [jpnet]
+    volumes:
+      - ../build:/app/build:ro
+      - jp-data-c:/data
+    environment:
+      JP_NAME: fedC
+      JP_PORT: "9100"
+      JP_HTTP_PORT: "9200"
+      JP_POW_LIB: /app/build/libjppow.so
+      JP_PEERS: "fedA:9100,fedB:9100"
+    ports:
+      - "9103:9100"
+      - "9203:9200"
+
+volumes:
+  jp-data-a:
+  jp-data-b:
+  jp-data-c:
+
+networks:
+  jpnet:
+    driver: bridge

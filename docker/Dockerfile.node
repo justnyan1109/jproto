@@ -1,0 +1,15 @@
+# Node jproto (federation) — python 3.12-slim + libjppow.so (host build, ro-mount)
+FROM python:3.12-slim
+
+# libstdc++ уже в slim (нужна libjppow.so); при нехватке — добавить:
+# RUN apt-get update && apt-get install -y --no-install-recommends libstdc++6 && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY python/ /app/
+RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
+
+# build/libjppow.so монтируется volume'ом на /app/pow/libjppow.so
+ENV JPPOW_LIB=/app/pow/libjppow.so JP_DATA_DIR=/data
+
+ENTRYPOINT ["python", "-m", "jproto_ref"]
+CMD ["--help"]

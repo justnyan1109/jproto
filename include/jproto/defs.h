@@ -54,6 +54,9 @@
 #define JP_ERR_POW           (-5)
 #define JP_ERR_IO            (-6)
 #define JP_ERR_EOF           (-7)   /* peer закрыл соединение в ожидании данных */
+#define JP_ERR_EMPTY         (-8)   /* shm: очередь пуста */
+#define JP_ERR_FULL          (-9)   /* shm: очередь полна */
+#define JP_ERR_TIMEOUT       (-10)
 
 /* AAD… inner-message типы (I_*), слои onion (protocol.md §5) */
 enum { I_ONLINE = 1, I_STORE_LOCAL = 2, I_STORE_GLOBAL = 3, I_OFFER = 4, I_REPLY = 5 };
