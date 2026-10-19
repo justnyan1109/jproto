@@ -2,6 +2,8 @@
 
 import os
 
+import pytest
+
 from jproto_ref import wire as W
 from jproto_ref import recipient as R
 from jproto_ref.crypto import KEM_CT_LEN, AEAD_NONCE_LEN
@@ -57,32 +59,52 @@ def test_scalars_transport_pow_err():
 
 def test_recipient_payload_roundtrip_online():
     pk, _sk = __import__("jproto_ref.crypto", fromlist=["kem_generate"]).kem_generate()
-    kyct, nonce, msg_ct = R.encaps_msg(pk, b"hello-B", session=0, seq=1, reply_to=0)
+    dest = os.urandom(32)
+    kyct, nonce, msg_ct = R.encaps_msg(pk, b"hello-B", session=1, seq=1, reply_to=0)
     body = R.online_body(kyct, nonce, msg_ct)
-    rec = R.build_recipient(W.I_ONLINE, 0, 1, body)
-    assert len(rec) == R.RECIPIENT_PT_MAX      # padding до полного слоя
+    rec = R.build_recipient(W.I_ONLINE, dest, 1, 1, 0, body)
+    assert len(rec) == R.PT_TARGET[W.I_ONLINE]     # padding до целевого PT
     meta = R.parse_recipient(rec)
-    assert meta["itype"] == W.I_ONLINE and meta["session"] == 0 and meta["seq"] == 1
+    assert meta["itype"] == W.I_ONLINE and meta["session"] == 1 and meta["seq"] == 1
+    assert meta["dest"] == dest and meta["reply_to"] == 0
     assert len(meta["body"]) == len(body)
-    # структуры совпадают с wire.md §5: header 14 = magic|ver|itype|sess|seq|body_len
+    # header-поля совпадают с AAD
     assert W.recipient_header(rec[:W.RECIPIENT_HDR_LEN])["body_len"] == len(body)
 
 
 def test_recipient_payload_store_body_and_aad():
     pk, sk = __import__("jproto_ref.crypto", fromlist=["kem_generate"]).kem_generate()
+    dest = os.urandom(32)
     cell = R.cell_index(os.urandom(32), pk, bytes(64), 0)
     kyct, nonce, msg_ct = R.encaps_msg(pk, b"pl", session=0, seq=1, reply_to=0)
-    body = R.store_body(cell, kyct, nonce, msg_ct)
+    body = R.store_body(kyct, nonce, msg_ct, cell)
     assert body[:32] == cell
     c2, k2, n2, m2 = R.parse_store_body(body)
     assert (c2, k2, n2, m2) == (cell, kyct, nonce, msg_ct)
-    parse = R.parse_recipient(R.build_recipient(W.I_STORE_LOCAL, 0, 1, body))
-    assert parse["itype"] == W.I_STORE_LOCAL
+    parse = R.parse_recipient(R.build_recipient(W.I_STORE_LOCAL, dest, 0, 1, 0, body))
+    assert parse["itype"] == W.I_STORE_LOCAL and parse["session"] == 0
 
-    sk_ptr = R.msg_aad(0, 1, 0)
-    assert sk_ptr == W.u32(0) + W.u32(1) + W.u32(0)
+    aad = R.msg_aad(0, 1, 0)
+    assert aad == W.u32(0) + W.u32(1) + W.u32(0)
     pt = R.decaps_msg(sk, kyct, nonce, msg_ct, 0, 1, 0)
     assert pt == b"pl"
+    with pytest.raises(ValueError):
+        R.decaps_msg(sk, kyct, nonce, msg_ct, 0, 1, 7)  # чужой reply_to в AAD
+
+
+def test_recipient_capacity_fits_offer_tlvs():
+    """OFFER-набор TLV обязан влезать в app-plaintext (DESIGN_NOTES §onion)."""
+    body_app = (W.build_tlv_bytes(W.T_SALT, bytes(64)) + W.build_tlv_bytes(W.T_SESSION, W.u32(1))
+                + W.build_tlv_bytes(W.T_ADDR, bytes(32))
+                + W.build_tlv_bytes(W.T_ROUTE, bytes(32) * 3))
+    assert len(body_app) <= R.MSG_CT_MAX, len(body_app)
+    pk, _sk = __import__("jproto_ref.crypto", fromlist=["kem_generate"]).kem_generate()
+    kyct, nonce, msg_ct = R.encaps_msg(pk, body_app, 0, 1, 0)
+    body = R.store_body(kyct, nonce, msg_ct, os.urandom(32))
+    rec = R.build_recipient(W.I_OFFER, os.urandom(32), 0, 1, 0, body)
+    assert len(rec) == R.PT_TARGET[W.I_OFFER]
+    blob = len(rec) + 16 + 12           # blob последнего слоя
+    assert blob + 16 < 65536            # и у укладки слоёв u16 не переполнится
 
 
 def test_wire_selftest():

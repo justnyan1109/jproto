@@ -86,10 +86,13 @@ I_REPLY            = 5
 
 # --- константы формата -------------------------------------------------------
 VERSION            = 1        # T_VER
-INNER_PACKET_SIZE  = 1280     # wire.md §5 (см. DESIGN_NOTES про структуру слоёв)
-RECIPIENT_HDR_LEN  = 14       # magic(2) ver(1) itype(1) session(4) seq(4) body_len(2)
+INNER_PACKET_SIZE  = 1280     # wire.md §5 (см. DESIGN_NOTES — Evaluation: BLOB ПОСЛЕДНЕГО
+                              #  СЛОЯ ПЕРЕМЕННЫЙ; 1280 было бы PT=1252 → app-payload ≤ 100 B)
+RECIPIENT_HDR_LEN  = 50       # magic(2) ver(1) itype(1) dest(32) session(4) seq(4) reply_to(4) body_len(2)
 RECIPIENT_MAGIC    = 0x4A50   # 'JP'
 MAX_MSG_PAYLOAD    = 8192     # из protocol.md §12 (в onion не помещается целиком — DESIGN_NOTES)
+KEM_CT_LEN         = 1088     # ML-KEM-768 ct (например внутри T_KYBER_CT)
+AEAD_NONCE_LEN     = 12
 
 CAPS_MIX           = 1 << 0
 CAPS_BS            = 1 << 1
@@ -255,37 +258,47 @@ def dec_transport(v: bytes) -> tuple[str, int, bool]:
 
 
 # --- recipient-payload helpers (wire.md §5, внутренний plaintext слоя L) ------
-# header: magic u16 'JP' ‖ ver u8 ‖ itype u8 ‖ session u32 ‖ seq u32 ‖ body_len u16
-# body: kyber_ct(1088) ‖ nonce(12) ‖ msg_ct(body_len-1100); далее CSPRNG padding.
-# Для store-типов (wire не оговаривает, где едет cell index через mix — см.
-# DESIGN_NOTES) body начинается c 32 B cell_index;
-# для ONLINE body = ky ‖ nonce ‖ msg_ct, якорь cell_index не нужен.
+# header 50 B: magic u16 'JP' ‖ ver u8 ‖ itype u8 ‖ dest(32) ‖ session u32 ‖
+#              seq u32 ‖ reply_to u32 ‖ body_len u16
+# body: store-типы (I_STORE_LOCAL/I_STORE_GLOBAL/I_OFFER/I_REPLY):
+#           cell_idx(32) ‖ kyber_ct(1088) ‖ nonce(12) ‖ msg_ct     [DESIGN_NOTES]
+#       I_ONLINE:          kyber_ct(1088) ‖ nonce(12) ‖ msg_ct
+# далее CSPRNG padding до целевого размера PT (см. jproto_ref.recipient).
+# dest нужен финальной ноде для адресации ONLINE-доставки (клиент зарегистрирован
+# T_ADDR в HELLO); session/seq/reply_to идут открыто — клиент берёт их для AAD;
+# integrity обеспечивает AEAD. Поле dest — пробел спеки (DESIGN_NOTES §recipient).
 
-def enc_recipient_header(itype: int, session: int, seq: int, body_len: int) -> bytes:
-    assert 1 <= itype <= 5, "it I_* 1..5"
-    return struct.pack("<HBBIIH", RECIPIENT_MAGIC, VERSION, itype, session, seq, body_len)
+def enc_recipient_header(itype: int, dest: bytes, session: int, seq: int,
+                         reply_to: int, body_len: int) -> bytes:
+    if not 1 <= itype <= 5 or len(dest) != 32:
+        raise ValueError("itype 1..5 / dest 32B required")
+    return struct.pack("<HBB", RECIPIENT_MAGIC, VERSION, itype) + bytes(dest) + \
+        struct.pack("<IIIH", session, seq, reply_to, body_len)
 
 
-def recipient_header(tvs_value: bytes) -> dict:
-    """Разбор заголовка recipient-payload (первое или «выпеленный» слой)."""
-    if len(tvs_value) < RECIPIENT_HDR_LEN:
+def recipient_header(value: bytes) -> dict:
+    """Разбор заголовка recipient-payload (PT последнего слоя)."""
+    if len(value) < RECIPIENT_HDR_LEN:
         raise ValueError("recipient header truncated")
-    magic, ver, itype, session, seq, body_len = struct.unpack_from("<HBBIIH", tvs_value, 0)
+    magic, ver, itype = struct.unpack_from("<HBB", value, 0)
     if magic != RECIPIENT_MAGIC:
         raise ValueError("bad magic")
     if ver != VERSION:
         raise ValueError("bad version")
+    if not 1 <= itype <= 5:
+        raise ValueError("bad itype")
+    dest = value[4:36]
+    session, seq, reply_to, body_len = struct.unpack_from("<IIIH", value, 36)
     if body_len < KEM_CT_LEN + AEAD_NONCE_LEN:
         raise ValueError("recipient body_len too small")
-    return {"itype": itype, "session": session, "seq": seq, "body_len": body_len}
+    return {"itype": itype, "dest": dest, "session": session, "seq": seq,
+            "reply_to": reply_to, "body_len": body_len}
 
 
-def strip_recipient_only(tvs_value: bytes) -> tuple[dict, bytes]:
-    """header + body:魔术, без padding; возвращает (meta, clean)."""
-    meta_len = RECIPIENT_HDR_LEN
-    meta = recipient_header(tvs_value)
-    clean = bytes(tvs_value[:meta_len + meta["body_len"]])
-    return meta, clean
+def recipient_clean(value: bytes) -> tuple[dict, bytes]:
+    """header + body без padding; возвращает (meta, header‖body)."""
+    meta = recipient_header(value)
+    return meta, bytes(value[:RECIPIENT_HDR_LEN + meta["body_len"]])
 
 
 # --- PoW cert (wire.md §6) ----------------------------------------------------
@@ -346,9 +359,10 @@ def selftest() -> None:
     cert = enc_pow_cert(2**40 + 5, 6, POW_TRANSPORT)
     assert dec_pow_cert(cert) == (2**40 + 5, 6, POW_TRANSPORT)
 
-    hdr = enc_recipient_header(I_OFFER, 11, 22, 1100)
+    hdr = enc_recipient_header(I_OFFER, b"\x11" * 32, 11, 22, 33, 1100)
     meta = recipient_header(hdr)
-    assert meta["itype"] == I_OFFER and meta["session"] == 11 and meta["seq"] == 22 and meta["body_len"] == 1100
+    assert meta["itype"] == I_OFFER and meta["session"] == 11 and meta["seq"] == 22
+    assert meta["reply_to"] == 33 and meta["body_len"] == 1100 and meta["dest"] == b"\x11" * 32
 
     _e = enc_err(7, "boom")
     assert dec_err(_e) == (7, "boom")

@@ -35,20 +35,88 @@ AEAD никогда не используется с nonce повторно дл
 - Мнемоника `РЕШЕНО:` клиент всегда выбирает маршрут из директории; первая нода — вход,
   третья нода — цель (home получателя / согласованная / BS).
 
-## 2. Beacons (раундовый seed)
+## 2. Beacons (раундовый seed) — hbdrand v2 (commit-reveal + подписи + проверяемость)
 
-- Раунд `N = floor(unix_ts / 10)`, длина раунда `ROUND_LEN = 10 s`.
-- Окно reveal: `[t0(N), t0(N)+3s]` — узел рассылает всем узлам
-  `commit_i = SHAKE256(tag=beacon.1, seed(N-1) ‖ v_i ‖ r_i \| 32)`, где `v_i` — 32 B CSPRNG,
-  `r_i` — 16 B salt.
-- В окне `[t0(N)+3s, t0(N)+6s]` — рассылка `reveal_i = (v_i, r_i)` + `ML-DSA-44 sig_i`.
-  Проверка: `SHAKE256(beacon.1, seed(N-1)‖v_i‖r_i) == commit_i` и подпись валидна.
-- В `t0(N)+6s`: упорядочиваем `v` по addr узла (32 B лексикографически),
-  `seed(N) = SHAKE256(beacon.1, seed(N-1) ‖ v_1 ‖ v_2 ‖ … ‖ v_k)` (_k_ = учтённые reveal).
-  Не пришедшие к дедлайну reveal — игнорируются. Seed(N) публикуется (клиент может запросить).
-- `seed_hour = seed(N − N mod 360)` (часовые раунды).
-- Клиент запрашивает seed у любой ноды. Ответ содержит `seed(N)` и `seed(N-1)` ( concoction
-  сервис при разъезде). Ожидание допускается в 1 раунд в любую сторону.
+Требования: post-quantum (без EC/BLS), без отдельного координатора, клиенты могут
+проверить seed сами по публичным данным, злоумышленник-меньшинство не может
+grinding’ом сместить seed, DoS одной нодой останавливает только её вклад.
+
+### 2.0. Транспорт beacon-фазы (директива)
+
+`commit/reveal/seed` фреймы передаются **только внутри secchan** (шифрованный
+ML-KEM-768+ChaCha20-Poly1305 канал нода↔нода, wire.md §7): распределённая
+генерация сидов защищается шифрованием — пассивный наблюдатель не видит ни
+значений v_i, ни кто/когда вносит вклад. Синхронизация раундов (окна t0+3s/+6s,
+deadlines) несекретна по своей природе — её достаточно защищать ML-DSA-подписями.
+
+### 2.1. Правила раунда
+
+`N = floor(unix_ts/10)`; длина раунда `ROUND_LEN = 10 s`; окно коммитов `t0..t0+3s`,
+окно ревейлов `t0+3s .. t0+6s`; финализация по local wall-clock.
+
+**Шаг A — commit** (в окне a): каждая нода рассылает всем НОДАМ
+```
+C_i  = SHAKE256(beacon.1, seed(N−1) ‖ N ‖ pk_i ‖ v_i ‖ r_i)     # 32 B
+sig_commit = ML-DSA-44(sign, sk_i, "JPCOMMIT"‖N‖C_i)
+кадр F_BEACON_COMMIT: T_ROUND, T_COMMIT(C_i), T_SIG, T_PK_DSA(pk_i)
+```
+Сигнатура обязательна: она перекрывает «подмену коммита после чужих» (grinding
+по составу) и даёт доказуемый double-commit.
+
+**Шаг B — reveal** (в окне b): reveal подтверждён коммитом:
+```
+reveal_i = (v_i, r_i), sig_reveal = ML-DSA-44(sk_i, "JPREVEAL"‖N‖v_i‖r_i)
+кадр F_BEACON_REVEAL: T_ROUND, T_SEED(v_i), T_NONCE(r_i), T_SIG
+participants: проверка SHAKE256(beacon.1, seed(N−1)‖N‖pk_i‖v_i‖r_i) == C_i,
+наличие всеEMPLARY commit сигнатуры того же pk (mismatch → reject).
+```
+
+**Шаг C — финализация** (в `t0+6s`):
+участники round_N = «ни трееn» legal reveal (свежая ML-DSA-44 sig + совпадающий
+commit). Упорядочим v_i по лексикографическому pk_i:
+```
+seed(N) = SHAKE256(beacon.1, seed(N−1) ‖ N ‖ v_{1} ‖ v_{2} ‖ … ‖ v_{k})
+```
+где k — число подтверждённых (норм. k ≥ 2 из FEDERATION_QUORUM=3). Публикация
+`F_BEACON_SEED`: seed(N), round N, список участвовавших pk_i, множество коммитов
+и ревейлов для проверки.
+
+### 2.2. Анти-grinding / DoS / подмена
+
+1. **Double-commit**: два разных C при одном pk (основано на валидной sig) —
+   инцидент → pk изгоняется из квора до ручного рестарта (ЛОГ).
+2. **Abstain в reveal**: нода вовремя не прислала reveal — её вклад просто
+   пропускается в этом раунде (**k−1 участвует**). Зарплата — потеря
+   «энтропии», порог для валидации всё равно метётся законом большинства.
+   В глобальном мониторинге замеряется «resp_rate», малый rate → узел понижается.
+3. **Grind по времени**: reveal-кадры, прибывшие позже `t0+6s`, **не входят** в
+   финализацию (жёсткое правило, или получатель отказ). Никто не «подстраивает»
+   принятый last-second reveal: он может быть просто «отложен» детект — нода,
+   систематически глубокая в окне b, голосует T_LEADER под «rejected» из-за
+   태mk (те ноды что нас baudrate 90% для сети, будет отброшено). Сетта можно
+   сделать NTP-скоростат.
+4. **Emergency**: в мини-сетях, если valid commits < 2 — seed(N) = seed(N−1)
+   (цепочка «стоит»), каждый узел ждёт до t0(N+1); раунд «пролетает».
+   Изоляция этой ситуации: raiseng «emergency count»...
+5. **Проверkeletal публикуемость**: любой клиент скачивает seed(N) у любой ноды
+   (кадр `F_BEACON_SEED`), проверяет: (a) все commit/reveal sig, (b) сортировку,
+   (c) пересчит SHAKE-обединение и сверяет. → «seed честный» есть proof.
+
+### 2.3. Получение seed клиентов
+
+Клиент перед отправкой запрашивает seed у любой федерационной ноды.
+Ответ содержит seed(N)/seed(N−1) (запас на небольшой clock skew −).
+При недоступности seed — буфер отвечает треки.
+
+### 2.4. Подпись свойств
+
+| Свойство | где гарантируется |
+|---|---|
+| unПрedictable future seed | commit-фаза (v скрыт) |
+| none-biasable joining | подписать commit невозможно дважды |
+| связь рауnd ↔ определён маршрут | seed(N−1) в свяже |
+| честный Public_entropy время | H(...) баланс CSPRNG всех нод |
+
 
 ## 3. PoW (RandomX, memory-hard, анти-квант)
 
@@ -70,7 +138,10 @@ pow_digest:
 - **Привязка к раунду**: раунд входит во `input`, поэтому решение валидно только
   в текущем (или ±1) раунде. Ключ = `seed_hour`, чтобы 256 MiB cache
   (324 ms инициализация) и dataset (2 GiB, ~3 мин) не пересчитывались каждый раунд.
-- **payload_digest** = SHAKE256(pow.1, сериализованная полезная нагрузка сообщения).
+- **payload_digest** зависит от профиля (см. wire.md §6):
+  · TRANSPORT → SHAKE256(pow.1, onion-пакет целиком) — проверяет entry n1;
+  · NODE → SHAKE256(pow.1, recipient-payload R, 7028 B) — проверяет BS-нода;
+  · READ → SHAKE256(pow.1, read-запрос) — проверяет BS.
 
 ### Budget-схема («универсальность» ПК/смартфонов)
 
@@ -139,30 +210,35 @@ body: последовательность TLV: `[type u16][len u32][value]`.
 | STORE_GLOBAL | 4 | случайная фед. — пишет в Global BS |
 | BS_READ | 0 | прямое подключение (MVP; позже — туннель) |
 
-Все узлы берутся из директории, вход n1 ≠ home(B) и т.д. случайные.
-Для каждого слоя `i ∈ {1..L}` клиент выполняет `Encaps(pk_i)` → `(ct_i, ss_i)`.
+Все узлы берутся из директории, вход n1 ≠ home(B) и т.д. случайные. Для каждого
+слоя клиент делает `Encaps(pk_i)` → `(ct_i, ss_i)`; пакет
+`packet = ct_1 ‖ blob_1` целиком (бинарная сборка — wire.md §5):
 
-Слой `i`:
 ```
-route_digest  = SHAKE256(mix.1, r1.addr ‖ … ‖ rL.addr ‖ round(N))
-layer_i       = AEAD_Enc(ss_i, nonce = CSPRNG 12B, aad = route_digest ‖ u8(i),
-                          plaintext = (next.addr[32B] | ct_{i+1} | next_layer_or_payload | padding)
+blob_i  = nonce(12) ‖ AEAD(ss_i, AD = "jproto.onion.1", PT = PT_i)
+PT_i    = next_addr(32) ‖ u16 ctl ‖ [ct_{i+1} 1088] ‖ blob_{i+1}
+финал (i=L): next_addr = 0^32, ctl = 0, remainder = R (recipient-payload 7028)
 ```
 
-`next.addr` слоя L = 32 B нулей (L-я нода — конечная). Каждый слой — фикс.
-`INNER_PACKET_SIZE = 1280 B` (padding — CSPRNG), чтобы скрыть метаданные длины.
-PoW_client прикрепляется к внешнему кадру: `F_MIX_ONION = [T_POW ‖ T_PAYLOAD]`.
+Длины детерминированы (R фиксирован; msg паддится CSPRNG): `packet(3) = 10478 B`
+(ONLINE), `packet(4) = 11628 B` (offline/BS). PoW TRANSPORT идёт TLV наружу
+(`F_MIX_ONION = [T_POW ‖ T_PAYLOAD]`); PoW NODE — внутри заголовка R (nonce u64
+на 12..20 байте), поэтому entry-нода не видит его, а BS-нода может пересчитать
+независимо (score/квота хранения).
 
-При peel нода i+1 получает peeled остаток: `ct_{i+2}‖layer_{i+1}` — это F_MIX_ONION
-с PoW_node (генерит нода i). Финальная нода L: ONLINE → отправка клиенту, иначе —
-запись в соответствующий BS.
+При peel нода i+1 получает `ct_{i+2}‖blob_{i+2}` (тот же формат F_MIX_ONION).
+Финальная нода L: ONLINE → доставка адресату, иначе — запись в соответствующий BS
+(после проверки PoW NODE по профилю).
 
 ## 6. Payload (внутри слоя L)
 
-`msg_ct = AEAD_Enc(ss_msg, nonce=CSPRNG12, aad = (sess u32, seq u32, reply_to u32?),
- plaintext = rec (recipient.body))`, где `ss_msg` — свежий ML-KEM-768 `Encaps(pk_B)`.
-Запись `(ky_ct, nonce, ct_msg, ...)` полностью указана в README (§5/§7), извлечение входа
-и проверка получателя операцией Decaps(sk_B).
+Recipient-payload R (7028 B, детальное поле-на-поле — wire.md §5):
+
+```
+hdr 24 B: 'JP', ver=1, itype, session u32, seq u32, pow_nonce u64, pow_bits, pow_prof, body_len u16
+body: kyber_ct(1088) ‖ aead_nonce(12) ‖ msg_ct(+tag16)      [CSPRNG-паддинг до 7028]
+msg_ct = AEAD(ss_msg, AD = itype‖session‖seq, msg),  ss_msg = свежий Encaps(pk_B)
+```
 
 Типы inner-message `I_*`: `ONLINE`, `STORE_LOCAL`, `STORE_GLOBAL`, `HANDSHAKE_OFFER`,
 `HANDSHAKE_REPLY`. Их поля — `docs/wire.md` и §5 wire-структуры ( recipient-payload).
@@ -229,7 +305,9 @@ PoW_client прикрепляется к внешнему кадру: `F_MIX_ONI
 | REVEAL_WINDOW | 3 s |
 | SEED_BLOCKS_PER_HOUR | 360 |
 | CELL_SIZE | 50 |
-| INNER_PACKET_SIZE | 1280 |
-| MAX_MSG_PAYLOAD | 8192 |
+| RPL_LEN_FIXED (R) | 7028 B |
+| MSG_PAYLOAD_MAX | 5888 B |
+| ONION packet (L=3 / L=4) | 10478 / 11628 B |
+| MAX_ROUNDS_SK | ~память… dev | (в v1 — статический) |
 | FEDERATION_QUORUM | 3 узла в dir (dev) |
 | Логирование | JSON-lines на stderr, `-v` |

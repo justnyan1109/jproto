@@ -15,6 +15,7 @@ enum {
     F_BEACON_COMMIT = 0x0060, F_BEACON_REVEAL = 0x0061, F_BEACON_SEED = 0x0062,
     F_GOSSIP_PUSH = 0x0070, F_GOSSIP_FETCH = 0x0071, F_GOSSIP_DATA = 0x0072,
     F_PING = 0x0080, F_PONG = 0x0081,
+    F_SCH_HELLO = 0x0090, F_SCH_HELLO_OK = 0x0091, F_SCH_SEALED = 0x0092,
 };
 
 /* tlv types (T_*) */
@@ -33,10 +34,7 @@ enum {
 
 /* msg types (I_*) и профили PoW — в defs.h */
 
-#define JP_TLV_MAX 255 /* TLV в кадре (упрощённо), frame buffer 64 KiB */
-
-#define JP_TLV_MAX 255 /* TLV в кадре (упрощённо), frame buffer 64 KiB */
-#define JP_FRAME_MAX 65536
+#define JP_TLV_MAX 255 /* TLV в кадре (упрощённо) */
 
 /* ---- varint (LEB128) ---- */
 size_t jp_varint_put(uint64_t v, uint8_t *out, size_t cap);

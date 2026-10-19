@@ -18,6 +18,15 @@ void jp_H(const char *tag, const uint8_t *in, size_t inlen, uint8_t out[JP_H_LEN
     EVP_MD_CTX_free(c);
 }
 
+void jp_HX(const char *tag, const uint8_t *in, size_t inlen, uint8_t *out, size_t outlen) {
+    EVP_MD_CTX *c = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(c, EVP_shake256(), NULL);
+    EVP_DigestUpdate(c, tag, strlen(tag));
+    if (inlen) EVP_DigestUpdate(c, in, inlen);
+    EVP_DigestFinalXOF(c, out, outlen);
+    EVP_MD_CTX_free(c);
+}
+
 void jp_random(uint8_t *buf, size_t n) {
     RAND_bytes(buf, (int)n);
 }
@@ -121,6 +130,24 @@ int jp_kem768_decaps(const uint8_t sk[JP_KEM768_SK_LEN],
     EVP_PKEY_free(p);
     if (!ok) return JP_ERR_CRYPTO;
     return JP_OK;
+}
+
+int jp_kem768_pk_from_sk(const uint8_t sk[JP_KEM768_SK_LEN], uint8_t pk[JP_KEM768_PK_LEN]) {
+    EVP_PKEY *p = EVP_PKEY_new_raw_private_key_ex(NULL, "ML-KEM-768", NULL, sk, JP_KEM768_SK_LEN);
+    if (!p) return JP_ERR_CRYPTO;
+    size_t l = JP_KEM768_PK_LEN;
+    int ok = EVP_PKEY_get_raw_public_key(p, pk, &l) > 0 && l == JP_KEM768_PK_LEN;
+    EVP_PKEY_free(p);
+    return ok ? JP_OK : JP_ERR_CRYPTO;
+}
+
+int jp_dsa44_pk_from_sk(const uint8_t sk[JP_DSA44_SK_LEN], uint8_t pk[JP_DSA44_PK_LEN]) {
+    EVP_PKEY *p = EVP_PKEY_new_raw_private_key_ex(NULL, "ML-DSA-44", NULL, sk, JP_DSA44_SK_LEN);
+    if (!p) return JP_ERR_CRYPTO;
+    size_t l = JP_DSA44_PK_LEN;
+    int ok = EVP_PKEY_get_raw_public_key(p, pk, &l) > 0 && l == JP_DSA44_PK_LEN;
+    EVP_PKEY_free(p);
+    return ok ? JP_OK : JP_ERR_CRYPTO;
 }
 
 /* ---------- ML-DSA-44 ---------- */

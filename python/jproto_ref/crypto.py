@@ -171,14 +171,14 @@ def _chacha20_block(key: bytes, counter: int, nonce: bytes) -> bytes:
 
 
 def _poly1305(key: bytes, msg: bytes) -> bytes:
-    r = int.from_bytes(key[:16], "little") & 0x0FFFFFFC0FFFFFFC0FFFFFFC0FFFFFFC
+    r = int.from_bytes(key[:16], "little") & 0x0FFFFFFC0FFFFFFC0FFFFFFC0FFFFFFF  # clamp (RFC 8439 §2.5.1)
     s = int.from_bytes(key[16:], "little")
     p = (1 << 130) - 5
     acc = 0
     for i in range(0, len(msg), 16):
         blk = msg[i:i + 16]
         n = int.from_bytes(blk, "little") + (1 << (8 * len(blk)))
-        acc = (acc + n * r) % p
+        acc = (acc + n) * r % p
     return ((acc + s) & ((1 << 128) - 1)).to_bytes(16, "little")
 
 

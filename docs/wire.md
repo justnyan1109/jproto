@@ -45,7 +45,10 @@ value(tlen байт)
 | 0x0051 | F_ONLINE_ACK | клиент→home-нода | подтверждение доставки (для MVP узел может игнорировать) |
 | 0x0060 | F_BEACON_COMMIT | node↔node | commit узла: SHAKE256(beacon.1, seed(N−1)‖v‖r) подписи нет |
 | 0x0061 | F_BEACON_REVEAL | node↔node | reveal (v, r) + ML-DSA-44 sig узла |
-| 0x0062 | F_BEACON_SEED | node→C/node→node | финальный seed(N) + используемое упорядочение (addr-сортировка) |
+| 0x0062 | F_BEACON_SEED | node→C/node→node | финальный seed(N) + использованное упорядочение (pk-сортировка §2) |
+| 0x0090 | F_SCH_HELLO | C→S | secchan handshake: T_PK_KEM, T_PK_DSA, T_SIG |
+| 0x0091 | F_SCH_HELLO_OK | S→C | secchan handshake: T_KYBER_CT, T_PK_DSA, T_SIG |
+| 0x0092 | F_SCH_SEALED | bidir | secchan насыпанный кадр: T_SEQ, T_MSG_CT |
 | 0x0070 | F_GOSSIP_PUSH | node↔node | Global BS diff: список индексов ячеек + digest записей + score/ts |
 | 0x0071 | F_GOSSIP_FETCH | node↔node | запрос нужных записей по digest |
 | 0x0072 | F_GOSSIP_DATA | node↔node | ответы на FETCH (сами записи) |
@@ -107,51 +110,101 @@ T_PAD       0x001F   padding (CSPRNG)
 
 ## 5. Onion-структура (binary)
 
-Слой i — ровно `INNER_PACKET_SIZE = 1280` B (число слоёв L по цели — см. §5 protocol.md):
+Пакет целиком: `packet = kem_ct_i(1088) ‖ blob_i` (наружный F_MIX payload).
+Слой после peel нодой i даёт PT_i, внутри которого всё для следующего hop'а:
+
 ```
-aead_nonce            12 B   CSPRNG на клиенте
-layer_ct             1268 B  = AEAD(ss_i, AD = route_digest(32 B) ‖ u8(i),
-                                PT = next_addr(32) [0^32 на слое L]
-                                   ‖ u16 ct_len ‖ ct_{i+1} (1088 при i<L)
-                                   ‖ inner_PT[до заполнения]
-                                 ), padding доводит до 1268
-route_digest = SHAKE256(mix.1, r1.addr ‖ … ‖ rL.addr ‖ round(N))
+blob_i    = aead_nonce(12) ‖ AEAD_ct(+tag 16),  AD = "jproto.onion.1" (14 B)
+PT_i      = next_addr(32) ‖ u16 ctl ‖ [ct_{i+1}(1088) если ctl=1088] ‖ blob_{i+1}
+финальный слой (i=L): next_addr = 0^32, ctl = 0 ⇒ remainder = R (recipient-payload)
 ```
-Внутренний plaintext слоя 3 (recipient-payload):
+
+Длины детерминированы базой R:
+
 ```
-magic u16 = 0x4A50 ('JP')
-ver   u8  = 1
-itype  u8  = I_={1 ONLINE,2 STORE_LOCAL,3 STORE_GLOBAL,4 OFFER,5 REPLY}
-session u32
-seq    u32
-body_len u16
-body: kyber_ct(1088) ‖ nonce(12) ‖ msg_ct(body_len−1100)
-padding CSPRNG до INNER_PACKET_SIZE
+|R| (RPL_LEN_FIXED)         = 7028 B   (wire-константа, msg паддингом CSPRNG)
+blob(depth d)               = 7090 + (d−1)*1150
+packet(L)                   = 1088 + blob(L):  L=3 → 10478,  L=4 → 11628
 ```
-AAD слоя 3 опционально включает PoW cert (связь PoW ↔ payload: переиспользование
-PoW cert с другой payload недопустимо). payload_digest для PoW считается
-по recipient-payload (весь inner де-толщина) — по константному входу.
+
+`ctl = 1088` у промежуточных слоёв, `0` — у финального; это единственная метка
+«последний слой» (контроль магии R catcher'ом BS/адресата).
+
+Recipient-payload R (7028 B):
+```
+hdr 24 B: magic u16 'JP', ver u8=1, itype u8, session u32, seq u32,
+          pow_nonce u64 LE, pow_bits u8, pow_prof u8, body_len u16
+body:     kyber_ct(1088) ‖ aead_nonce(12) ‖ msg_ct(msg+tag16)
+tail:     CSPRNG padding до 7028 (в body_len не входит)
+```
+
+msg_ct = AEAD(ss_msg, AD = itype‖session‖seq (9 B), plaintext = msg), ss_msg —
+свежий ML-KEM-768 `Encaps(pk_B)`. PoW-сертификаты: TRANSPORT-профиль (nonce/bits)
+идёт TLV `T_POW` наружного кадра F_MIX_ONION (дайджест = H(pow.1, packet));
+NODE-профиль живёт в заголовке R (дайджест = H(pow.1, R)) — детали §6.
 
 ## 6. PoW cert (T_POW)
+
 ```
 nonce    u64   LE
 bits     u8
 profile  u8    1=TRANSPORT 2=NODE 3=READ
-reserved u8[6] = 0
 ```
-Проверка узла: получить payload_digest ( определён §3 protocol.md), вычислить
-`RandomX_H(seed_hour, seed_round ‖ payload_digest ‖ nonce)`, посчитать ведущие
-нулевые биты → `bits ≥ required(profile, round)`.
+
+Проверка RandomX-сертификата: `digest_Rx = RandomX_H(key = seed_hour(32),
+input = seed_round(32) ‖ payload_digest(32) ‖ nonce)`, требование — ведущие
+нулевые биты digest_Rx ≥ bits ≥ required(profile, round). Два места привязки:
+
+| профиль | payload_digest = | кто проверяет | где nonce |
+|---|---|---||
+| TRANSPORT | H(pow.1, onion-пакет целиком) | entry-нода n1 (анти-flood) | TLV T_POW наружного кадра |
+| NODE | H(pow.1, R 7028 B) | BS-нода nL (storage-скора/квота) | байт 12..20 заголовка R |
+| READ | H(pow.1, read-запрос) | BS при чтении | T_POW кадра запроса |
+
+Пересчёт в payload_digest записи изменять нельзя — PoW сертифицирует
+конкретный пакет (переиспользование с другим payload недопустимо).
+
+## 7. Secchan — шифрованный канал (нода↔нода, клиент↔нода)
+
+Директива: **beacon commit/reveal/gossip передаются только по secchan**;
+синхронизация раундов (окна, тайминги) остаётся несекретной — её защищают
+ML-DSA подписи, а не шифрование.
+
+Рукопожатие (plaintext-кадры, ключи внутри):
+```
+C→S  F_SCH_HELLO:     T_PK_KEM(c 1184), T_PK_DSA(c 1312), T_SIG(c 2420)
+                      sig_c = ML-DSA-44(sk_c, "JPCS1" ‖ kem_pk_c(1184))
+S→C  F_SCH_HELLO_OK:  T_KYBER_CT(ct_s 1088), T_PK_DSA(s 1312), T_SIG(s 2420)
+                      ct_s = Encaps(kem_pk_c)
+                      sig_s = ML-DSA-44(sk_s, "JPCS2" ‖ kem_pk_c ‖ ct_s)
+```
+Вывод ключей (`ss` = Decaps(kem_sk_c, ct_s)):
+```
+th = SHAKE256(secch.1, kem_pk_c(1184) ‖ ct_s(1088))          # transcript 32 B
+K  = SHAKE256(secch.1, ss(32) ‖ th(32)) → 88 B:
+     c2s.key(32) ‖ c2s.nonce_base(12) ‖ s2c.key(32) ‖ s2c.nonce_base(12)
+```
+Насыпанный кадр `F_SCH_SEALED`: TLV `T_SEQ(u64 LE)` ∥ `T_MSG_CT`:
+```
+nonce = nonce_base; nonce[4..12] ^= u64_le(seq)
+AD    = "JPSFR" ‖ u64_le(seq)      (13 B)
+```
+`seq` строго `+1` по каждому направлению (replay/loss → кадр отбрасывается,
+соединение помечается испорченным). BEACON- и GOSSIP-кадры заворачиваются
+в T_MSG_PT как единое целое их содержимого.
 
 
-## 7. Beacon-кадры
+## 8. Beacon-кадры
 
-- `F_BEACON_COMMIT`: `T_ROUND` ∥ `T_COMMIT(32)`; подпись commit не нужна, но
-  reveal подписывается (см. §2 protocol.md).
-- `F_BEACON_REVEAL`: `T_ROUND` ∥ `T_SEED(v)` ∥ `T_NONCE(r 16)` ∥ `T_SIG`.
-- `F_BEACON_SEED`: `T_ROUND` ∥ `T_SEED` ∥ список участвовавших `T_ADDR`.
+- `F_BEACON_COMMIT`: `T_ROUND` ∥ `T_COMMIT(C_i 32)` ∥ `T_PK_DSA` ∥ `T_SIG`
+  (sig = ML-DSA-44(sk_i, "JPCOMMIT" ‖ round ‖ C_i) — см. §2 protocol.md).
+- `F_BEACON_REVEAL`: `T_ROUND` ∥ `T_SEED(v)` ∥ `T_NONCE(r 16)` ∥ `T_SIG`
+  (sig = ML-DSA-44(sk_i, "JPREVEAL" ‖ round ‖ v ‖ r)).
+- `F_BEACON_SEED`: `T_ROUND` ∥ `T_SEED` ∥ список участвовавших `T_PK_DSA`.
 
-## 8. Gossip (Global BS sync)
+Все три типа передаются только через secchan (§7).
+
+## 9. Gossip (Global BS sync)
 
 Global BS держит записи с адресацией по `cell_index` (32 B). Синхронизация push-моделью:
 

@@ -12,6 +12,8 @@ extern "C" {
 
 /* ---- H: SHAKE256(tag ‖ x, 32) ---- */
 void jp_H(const char *tag, const uint8_t *in, size_t inlen, uint8_t out[JP_H_LEN]);
+/* XOF-вариант: произвольная длина выхода */
+void jp_HX(const char *tag, const uint8_t *in, size_t inlen, uint8_t *out, size_t outlen);
 
 /* CSPRNG / затирание */
 void jp_random(uint8_t *buf, size_t n);
@@ -32,6 +34,10 @@ int jp_kem768_encaps(const uint8_t pk[JP_KEM768_PK_LEN],
                      uint8_t ct[JP_KEM768_CT_LEN], uint8_t ss[JP_KEM768_SS_LEN]);
 int jp_kem768_decaps(const uint8_t sk[JP_KEM768_SK_LEN],
                      const uint8_t ct[JP_KEM768_CT_LEN], uint8_t ss[JP_KEM768_SS_LEN]);
+
+/* derive pk из raw sk (ML-KEM-768 / ML-DSA-44) */
+int jp_kem768_pk_from_sk(const uint8_t sk[JP_KEM768_SK_LEN], uint8_t pk[JP_KEM768_PK_LEN]);
+int jp_dsa44_pk_from_sk(const uint8_t sk[JP_DSA44_SK_LEN], uint8_t pk[JP_DSA44_PK_LEN]);
 
 /* ---- ML-DSA-44 (подписи узлов; raw pk 1312 / sk 2560, sig 2420) ---- */
 int jp_dsa44_keygen(uint8_t pk[JP_DSA44_PK_LEN], uint8_t sk[JP_DSA44_SK_LEN]);

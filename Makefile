@@ -8,7 +8,9 @@ LIBS    := -lcrypto
 RX_DIR   := vendor/RandomX
 RX_LIB   := $(RX_DIR)/build/librandomx.a
 
-CSRCS := src/crypto.c src/framing.c src/net.c src/onion.c src/jppow.c
+# jppow живёт отдельным .so (ctypes/C-dlopen); в статике либы его не включаем
+CSRCS := src/crypto.c src/framing.c src/net.c src/onion.c src/client.c src/secchan.c
+POW_SRC := src/jppow.c
 LIBOBJS := $(patsubst src/%.c,build/obj/%.o,$(CSRCS))
 
 all: build/obj build/libjproto.a build/jpc build/t_all tests
@@ -38,13 +40,15 @@ build/t_crypto: tests/t_crypto.c src/crypto.c | build
 	$(CC) $(CFLAGS) $(INC) tests/t_crypto.c src/crypto.c -o $@ $(LIBS)
 build/t_framing: tests/t_framing.c src/framing.c | build
 	$(CC) $(CFLAGS) $(INC) tests/t_framing.c src/framing.c -o $@
-build/t_onion: tests/t_onion.c src/onion.c src/crypto.c | build
-	$(CC) $(CFLAGS) $(INC) tests/t_onion.c src/onion.c src/crypto.c -o $@ $(LIBS)
+build/t_onion: tests/t_onion.c src/onion.c src/client.c src/crypto.c | build
+	$(CC) $(CFLAGS) $(INC) tests/t_onion.c src/onion.c src/client.c src/crypto.c -o $@ $(LIBS)
+build/t_secchan: tests/t_secchan.c src/secchan.c src/crypto.c src/framing.c src/net.c | build
+	$(CC) $(CFLAGS) $(INC) tests/t_secchan.c src/secchan.c src/crypto.c src/framing.c src/net.c -o $@ $(LIBS) -lpthread
 build/t_pow: tests/t_pow.c build/libjppow.so
 	$(CC) $(CFLAGS) $(INC) tests/t_pow.c -o $@ build/libjppow.so -L$(RX_DIR)/build -lrandomx -lcrypto -Wl,-rpath,$$PWD/build -Wl,-rpath,$$PWD/$(RX_DIR)/build
 
-tests: build/t_crypto build/t_framing build/t_onion build/t_shm build/t_uring build/t_pow
-	build/t_crypto && build/t_framing && build/t_onion && build/t_shm && build/t_uring && build/t_pow
+tests: build/t_crypto build/t_framing build/t_onion build/t_shm build/t_uring build/t_secchan build/t_pow
+	build/t_crypto && build/t_framing && build/t_onion && build/t_shm && build/t_uring && build/t_secchan && build/t_pow
 
 build/t_shm: tests/t_shm.c src/shm.c | build
 	$(CC) $(CFLAGS) $(INC) tests/t_shm.c src/shm.c -o $@ -lpthread
