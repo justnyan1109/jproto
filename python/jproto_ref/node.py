@@ -11,19 +11,21 @@ sk-как-seed и т.д.).
     форвард ct_next‖blob_next дальше (без per-hop майнинга); финальный слой —
     R: ONLINE → доставка клиенту; store → NODE-PoW из заголовка R и вставка в BS
     по cell = h_cell(value);
-  * BS: Local (256 dev-ячеек) для I_STORE_LOCAL/I_OFFER/I_REPLY/I_STORE_GLOBAL?;
-    Global (1024) для I_STORE_GLOBAL; прямые пути F_BS_STORE (TRANSPORT PoW) и
-    F_BS_READ (READ PoW); eviction score = bits − age_s//3600 внутри ячейки;
+  * BS: Local (256 dev-ячеек) для local-store-типов; Global (1024) для
+    I_STORE_GLOBAL; прямые пути F_BS_STORE (TRANSPORT PoW) и F_BS_READ
+    (READ PoW); eviction score = bits − age_s//3600 внутри ячейки;
   * gossip: PUSH/FETCH/DATA для Global BS (digest = h_rec(value));
   * ONLINE-доставка зарегистрированным клиентам (HELLO c T_ADDR);
+  * secchan (wire.md §7): сниффер первого кадра — F_SCH_HELLO → весь дальнейший
+    трафик насыпанный; dial пиров — handshake по умолчанию (cfg secure_dial);
+    plain-кадры клиентов разрешены (cfg plain_ok);
   * HTTP-обёртка: POST /jp (кадры в один ход) и GET /status;
   * JSON-lines логи в stderr;
   * rate limit 5 msg/s/IP на «тарифицируемые» типы кадров;
   * снимок BS в data_dir (bs_snapshot.json) при остановке и по таймеру.
 
 Ключ PoW (seed_hour) — статичный cfg['pow_seed_hour'] (default DEV_SEED_HOUR);
-привязка PoW к раунду живёт в seed_round во входе jppow. secchan — TODO (beacon
-и gossip пока в открытом wire-виде; см. wire.md §7 и src/secchan.c в C).
+привязка PoW к раунду живёт в seed_round во входе jppow.
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ from concurrent.futures import ThreadPoolExecutor
 from . import crypto as C
 from . import pow as JP
 from . import recipient as R
+from . import secchan as SC
 from . import wire as W
 
 # --- defaults конфига (переопределяются в cfg; tests/set особо) ---------------
@@ -72,6 +75,8 @@ DEFAULTS = {
     "skip_pow": False,          # dev-knob: не просить PoW вовсе
 
     "rate_limit": 5.0,          # msg/s/IP (протокол: 5)
+    "secure_dial": True,        # нода↔нода: handshake secchan после TCP-dial
+    "plain_ok": True,           # принимать plain-кадры от клиентов (dev-совместимо)
     "max_local_cells": 256,
     "max_global_cells": 1024,
     "cell_size": 50,
@@ -80,7 +85,6 @@ DEFAULTS = {
 
 # Тарифицируемые типы кадров (rate limit applies; beacon/gossip/ping свободны).
 RT_LIMITED = {W.F_MIX_ONION, W.F_BS_STORE, W.F_BS_READ, W.F_SEED_REQ, W.F_DIR_REQ}
-MAX_FRAME_TOTAL = 60000    # guard: varint(total) больше — соединение рвём
 
 
 def log_json(node_name: str, lvl: str, ev: str, **kw) -> None:
@@ -94,7 +98,7 @@ def log_json(node_name: str, lvl: str, ev: str, **kw) -> None:
 # --- session ------------------------------------------------------------------
 
 class Sess:
-    __slots__ = ["reader", "writer", "ip", "port", "kind", "addr", "closed", "id"]
+    __slots__ = ["reader", "writer", "ip", "port", "kind", "addr", "closed", "id", "sec"]
 
     def __init__(self, reader, writer, ip: str, port: int, kind: str = "?"):
         self.reader = reader
@@ -104,11 +108,14 @@ class Sess:
         self.kind = kind          # 'client' | 'node' | 'http' | '?'
         self.addr: bytes | None = None
         self.closed = False
+        self.sec: SC.SecChan | None = None   # насыпанный канал (wire.md §7)
         self.id = id(self)
 
     async def send(self, frame: bytes) -> None:
         if self.closed:
             return
+        if self.sec is not None:
+            frame = self.sec.seal_bytes(frame)
         self.writer.write(frame)
         try:
             await self.writer.drain()
@@ -124,28 +131,7 @@ class Sess:
                 pass
 
 
-async def read_frame(reader) -> W.Frame | None:
-    """Читает varint(total) + payload; None — EOF; ValueError — мусор."""
-    total = 0
-    shift = 0
-    first = True
-    while True:
-        chunk = await reader.readexactly(1)
-        b = chunk[0]
-        if first:
-            first = False
-        total |= (b & 0x7F) << shift
-        if not (b & 0x80):
-            break
-        shift += 7
-        if shift > 63:
-            raise ValueError("varint too long")
-    if first or total < 4 or total > MAX_FRAME_TOTAL:
-        raise ValueError(f"bad frame total {total}")
-    payload = await reader.readexactly(total)
-    ftype, flags = payload[0] | (payload[1] << 8), payload[2] | (payload[3] << 8)
-    tvs = W.parse_tvs(payload[4:])
-    return W.Frame(ftype, flags, tvs)
+read_frame = SC.read_frame     # async-ридер wire-кадров (общий с secchan)
 
 
 def frame_bytes(payload: bytes) -> bytes:
@@ -291,7 +277,30 @@ class Node:
         sess = Sess(reader, writer, ip, port)
         self.sessions[sess.id] = sess
         try:
-            await self._conn_reader(sess)
+            # Сниффер первого кадра: F_SCH_HELLO → secchan (все последующие кадры
+            # насыпаны); любой другой кадр — plain (dev-совместимость клиентов).
+            try:
+                first = await read_frame(sess.reader)
+            except ValueError as e:
+                log_json(self.name, "warn", "conn_bad_frame", err=str(e), ip=ip)
+                return
+            if first is None:
+                return
+            if first.type == W.F_SCH_HELLO:
+                try:
+                    sess.sec = await SC.handshake_server(
+                        sess.reader, sess.writer, self.sk_dsa, first_frame=first)
+                except Exception as e:
+                    log_json(self.name, "warn", "sch_server_fail", err=repr(e), ip=ip)
+                    return
+                log_json(self.name, "info", "sch_server_ok", ip=ip)
+                await self._conn_reader(sess)
+            elif self.cfg["plain_ok"]:
+                await self._dispatch(sess, first)
+                await self._conn_reader(sess)
+            else:
+                log_json(self.name, "warn", "plain_rejected", ftype=hex(first.type), ip=ip)
+                return
         except (asyncio.IncompleteReadError, ConnectionError, asyncio.CancelledError):
             pass
         except Exception as e:  # мусор в потоке — не роняем сервер
@@ -301,10 +310,24 @@ class Node:
 
     async def _conn_reader(self, sess: Sess) -> None:
         while not sess.closed:
-            try:
-                fr = await read_frame(sess.reader)
-            except (asyncio.IncompleteReadError, ConnectionError):
-                break
+            if sess.sec is not None:
+                try:
+                    fr = await sess.sec.recv_frame()
+                except SC.SchError as e:
+                    log_json(self.name, "warn", "sch_broken", err=str(e), ip=sess.ip)
+                    sess.close()
+                    break
+                except (asyncio.IncompleteReadError, ConnectionError):
+                    break
+            else:
+                try:
+                    fr = await read_frame(sess.reader)
+                except (asyncio.IncompleteReadError, ConnectionError):
+                    break
+                except ValueError as e:
+                    log_json(self.name, "warn", "conn_bad_frame", err=str(e), ip=sess.ip)
+                    sess.close()
+                    break
             await self._dispatch(sess, fr)
 
     def _unregister(self, sess: Sess) -> None:
@@ -358,31 +381,6 @@ class Node:
                 self._pow_ctxs.pop(old).close()
             self._pow_ctxs[self.pow_hour_seed] = JP.Pow(self.pow_hour_seed)
         return self._pow_ctxs[self.pow_hour_seed]
-
-    def _verify_pow(self, round_num: int, payload_digest: bytes, cert: bytes,
-                    profile: int, required_bits: int) -> bool:
-        """verify по candidates seed(round−1..round+1); ключ RandomX — cfg (конст.)."""
-        try:
-            nonce, bits, cert_profile = W.dec_pow_cert(cert)
-        except ValueError:
-            return False
-        if cert_profile != profile or bits < required_bits:
-            return False
-        if self.cfg["skip_pow"]:
-            return True
-        ctx = None
-        try:
-            ctx = self._pow_ctx_for(round_num)
-        except JP.PowUnavailable as e:
-            log_json(self.name, "warn", "pow_unavailable", err=str(e))
-            return False
-        for c in (round_num - 1, round_num, round_num + 1):
-            seed = self.seeds.get(c)
-            if seed is None:
-                continue
-            if JP.verify(ctx, seed, payload_digest, nonce, bits, required_bits):
-                return True
-        return False
 
     async def _mine(self, round_num: int, payload_digest: bytes, min_bits: int,
                     profile: int, budget_hint: int) -> tuple[int, int] | None:
@@ -490,11 +488,13 @@ class Node:
 
     def _pow_common(self, pd: bytes, nonce: int, bits: int, profile: int,
                     required: int) -> bool:
-        """verify по seeds раундов (n−1, n, n+1); ключ RandomX — статичный cfg."""
-        if bits < required:
-            return False
+        """verify по seeds раундов (n−1, n, n+1); ключ RandomX — статичный cfg.
+        profile — ОЖИДАЕМЫЙ профиль сертификата (cert с чужим профилем → False).
+        skip_pow: dev-knob — не просить PoW вовсе (разрешает zero-cert)."""
         if self.cfg["skip_pow"]:
             return True
+        if bits < required:
+            return False
         try:
             ctx = self._pow_ctx_for(0)
         except JP.PowUnavailable as e:
@@ -513,18 +513,25 @@ class Node:
         просто форвардят после peel (NODE-PoW живёт в R, проверяет BS-нода)."""
         pay = W.get(fr.tvs, W.T_PAYLOAD)
         cert = W.get(fr.tvs, W.T_POW)
-        if (not pay or not cert or len(cert) != 16
+        if (not pay or (cert and len(cert) != 16)
                 or len(pay) < C.KEM_CT_LEN + R.BLOB_BASE):
             return reply(W.F_MIX_ACK, tvs=[(W.T_ERR, W.enc_err(400, "bad mix"))])
-        try:
-            nonce, bits, prof = W.dec_pow_cert(cert)
-        except ValueError:
-            return reply(W.F_MIX_ACK, tvs=[(W.T_ERR, W.enc_err(400, "cert"))])
-        if not self._pow_common(JP.pow_digest(pay), nonce, bits,
-                                W.POW_TRANSPORT, self.cfg["transport_bits"]):
-            self.counters["pow_fail"] += 1
-            log_json(self.name, "warn", "mix_drop_pow", ip=sess.ip, bits=bits)
-            return reply(W.F_MIX_ACK, tvs=[(W.T_ERR, W.enc_err(401, "pow"))])
+        if cert is not None:
+            # entry-кадр: TRANSPORT-PoW верифицируем (digest = h_pow(packet)).
+            try:
+                nonce, bits, prof = W.dec_pow_cert(cert)
+            except ValueError:
+                return reply(W.F_MIX_ACK, tvs=[(W.T_ERR, W.enc_err(400, "cert"))])
+            if prof != W.POW_TRANSPORT or not self._pow_common(
+                    JP.pow_digest(pay), nonce, bits,
+                    W.POW_TRANSPORT, self.cfg["transport_bits"]):
+                self.counters["pow_fail"] += 1
+                log_json(self.name, "warn", "mix_drop_pow", ip=sess.ip, bits=bits)
+                return reply(W.F_MIX_ACK, tvs=[(W.T_ERR, W.enc_err(401, "pow"))])
+        else:
+            # hop-кадр без cert: валидность даёт restore peel ниже; тарифицируем
+            # тем же rate limit (RT_LIMITED). Указано в wire.md §5 v2.
+            log_json(self.name, "info", "mix_hop_uncert", ip=sess.ip)
         self.counters["mix_in"] += 1
 
         try:
@@ -562,20 +569,18 @@ class Node:
         return None
 
     async def _forward_mix(self, entry: dict, frame: bytes) -> None:
-        """Либо переиспользуем persistent peer conn, либо fresh dial."""
+        """Либо переиспользуем persistent peer conn, либоfresh dial (в обоих
+        случаях нода↔нода secchan при secure_dial)."""
         key = (entry["host"], entry["port"])
         sess = self.peer_conns.get(key)
         if sess and not sess.closed:
             await sess.send(frame)
             return
         try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(entry["host"], entry["port"]), 5.0)
+            fs = await self._dial_raw(entry["host"], entry["port"])
         except Exception as e:
             log_json(self.name, "warn", "mix_dial_fail", to=key, err=repr(e))
             return
-        fs = Sess(reader, writer, entry["host"], entry["port"], kind="node")
-        self.sessions[fs.id] = fs
         await fs.send(frame)
         asyncio.create_task(self._conn_reader(fs))
 
@@ -598,9 +603,12 @@ class Node:
                 log_json(self.name, "warn", "online_no_client")
                 return
             log_json(self.name, "info", "online_deliver",
-                     sessn=meta["session"], seq=meta["seq"])
-            await waiting[0].send(reply(W.F_ONLINE_DELIVER,
-                                        tvs=[(W.T_PAYLOAD, rpl)]))
+                     sessn=meta["session"], seq=meta["seq"], n=len(waiting))
+            # доставляем ВСЕМ HELLO-registered (DESIGN_NOTES): вскроет владелец
+            # ключа (implicit rejection), остальные молча выкинут.
+            frame = reply(W.F_ONLINE_DELIVER, tvs=[(W.T_PAYLOAD, rpl)])
+            await asyncio.gather(*(sc.send(frame) for sc in waiting),
+                                 return_exceptions=True)
             return
         if meta["pow_prof"] != W.POW_NODE or meta["pow_bits"] < self.cfg["node_bits"]:
             self.counters["pow_fail"] += 1
@@ -657,20 +665,23 @@ class Node:
         idx = W.get(fr.tvs, W.T_CELL_IDX)
         rec = W.get(fr.tvs, W.T_CELL_REC)
         cert = W.get(fr.tvs, W.T_POW)
-        if not idx or len(idx) != 32 or not rec or not cert or len(rec) < 1136:
+        # формат rec: value(len ≥ 1116 = ky+nonce+tag) ‖ score(u32) ‖ ts(u64);
+        # последние 12 B клиентские, хранению не подлежат (нода перезапишет).
+        min_rec = C.KEM_CT_LEN + C.AEAD_NONCE_LEN + C.AEAD_TAG_LEN + 12
+        if not idx or len(idx) != 32 or not rec or not cert or len(rec) < min_rec:
             return reply(W.F_BS_READ_RESP, tvs=[(W.T_ERR, W.enc_err(400, "bad store"))])
-        my_pd = JP.pow_digest(idx + rec)
-        if not self._verify_pow(0, my_pd, cert, W.POW_TRANSPORT, self.cfg["transport_bits"]):
-            # 0-раунд: для direct-store привязка к раунду опциональна (cert сам
-            # привязан к cell+rec); если seedов нет — верить НЕЛЬЗЯ, drop.
-            if not self.cfg["skip_pow"] and self.seeds:
-                self.counters["pow_fail"] += 1
-                log_json(self.name, "warn", "bs_store_pow", cell=idx.hex()[:16])
-                return reply(W.F_BS_READ_RESP, tvs=[(W.T_ERR, W.enc_err(401, "pow"))])
         try:
             nonce, bits, profile = W.dec_pow_cert(cert)
         except ValueError:
             return reply(W.F_BS_READ_RESP, tvs=[(W.T_ERR, W.enc_err(400, "cert"))])
+        # digest привязан к cell+rec → переиспользование cert для другой записи
+        # исключено; раунд — окно (n−1, n, n+1), как везде (_pow_common).
+        my_pd = JP.pow_digest(idx + rec)
+        if profile != W.POW_TRANSPORT or not self._pow_common(
+                my_pd, nonce, bits, W.POW_TRANSPORT, self.cfg["transport_bits"]):
+            self.counters["pow_fail"] += 1
+            log_json(self.name, "warn", "bs_store_pow", cell=idx.hex()[:16])
+            return reply(W.F_BS_READ_RESP, tvs=[(W.T_ERR, W.enc_err(401, "pow"))])
         ts = time.time()
         ok = self._bs_insert(self.local_bs, idx, rec[:len(rec) - 12], int(bits), ts,
                              self.cfg["max_local_cells"], self.cfg["cell_size"])
@@ -684,12 +695,16 @@ class Node:
         cert = W.get(fr.tvs, W.T_POW)
         if not idx or len(idx) != 32 or not cert:
             return reply(W.F_BS_READ_RESP, tvs=[(W.T_ERR, W.enc_err(400, "bad read"))])
+        try:
+            nonce, bits, profile = W.dec_pow_cert(cert)
+        except ValueError:
+            return reply(W.F_BS_READ_RESP, tvs=[(W.T_ERR, W.enc_err(400, "cert"))])
         pd = JP.pow_digest(idx)
-        if not self._verify_pow(0, pd, cert, W.POW_READ, self.cfg["read_bits"]):
-            if not self.cfg["skip_pow"] and self.seeds:
-                self.counters["pow_fail"] += 1
-                log_json(self.name, "warn", "bs_read_pow", cell=idx.hex()[:16])
-                return reply(W.F_BS_READ_RESP, tvs=[(W.T_ERR, W.enc_err(401, "pow"))])
+        if profile != W.POW_READ or not self._pow_common(
+                pd, nonce, bits, W.POW_READ, self.cfg["read_bits"]):
+            self.counters["pow_fail"] += 1
+            log_json(self.name, "warn", "bs_read_pow", cell=idx.hex()[:16])
+            return reply(W.F_BS_READ_RESP, tvs=[(W.T_ERR, W.enc_err(401, "pow"))])
         self.counters["bs_read"] += 1
         now = time.time()
         recs = []
@@ -1005,15 +1020,15 @@ class Node:
         return self._stop_evt is not None and self._stop_evt.is_set()
 
     async def _dial_peer(self, host: str, port: int) -> None:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), 5.0)
-        fs = Sess(reader, writer, host, port, kind="node")
-        self.sessions[fs.id] = fs
+        fs = await self._dial_raw(host, port)
         self.peer_conns[(host, port)] = fs
         hello = reply(W.F_HELLO, tvs=[(W.T_VER, W.u16(W.VERSION)),
-                                      (W.T_CAPS, W.u32(W.CAPS_MIX | W.CAPS_BS | W.CAPS_BEACON | W.CAPS_GOSSIP)),
-                                      (W.T_ADDR, self.addr)])
+                                      (W.T_CAPS, W.u32(W.CAPS_MIX | W.CAPS_BS | W.CAPS_BEACON | W.CAPS_GOSSIP))])
         await fs.send(hello)
-        fr = await read_frame(reader)
+        if fs.sec is not None:
+            fr = await fs.sec.recv_frame()
+        else:
+            fr = await read_frame(fs.reader)
         if fr is None or fr.type != W.F_HELLO_OK:
             fs.close()
             return
@@ -1022,7 +1037,30 @@ class Node:
         if dfx:
             await fs.send(dfx)
         asyncio.create_task(self._conn_reader(fs))
-        log_json(self.name, "info", "peer_up", to=f"{host}:{port}")
+        log_json(self.name, "info", "peer_up", to=f"{host}:{port}",
+                 secured=fs.sec is not None)
+
+    async def _dial_raw(self, host: str, port: int) -> Sess:
+        """TCP-dial (+secchan при secure_dial). pin: валидный dir-entry этого
+        host:port → жда́ем ровно его pk_dsa; иначе принимаем (TOFU, лог warn)."""
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), 5.0)
+        fs = Sess(reader, writer, host, port, kind="node")
+        self.sessions[fs.id] = fs
+        if self.cfg["secure_dial"]:
+            expect = None
+            for e in self.dir.values():
+                if e["addr"] != self.addr and e["host"] == host and e["port"] == port:
+                    expect = e["pk_dsa"]
+            try:
+                fs.sec = await asyncio.wait_for(
+                    SC.handshake_client(reader, writer, self.sk_kem, self.sk_dsa,
+                                        expect_pk=expect), 10.0)
+            except Exception as e:
+                log_json(self.name, "warn", "sch_dial_fail", to=f"{host}:{port}",
+                         err=repr(e))
+                fs.close()
+                raise
+        return fs
 
     # --- BS snapshot -------------------------------------------------------------------
 
@@ -1146,6 +1184,7 @@ class Node:
             "peers": len(self.dir),
             "peer_conns": sum(1 for s in self.peer_conns.values() if not s.closed),
             "clients": sum(len(v) for v in self.online.values()),
+            "sec_sessions": sum(1 for s in self.sessions.values() if s.sec),
             "round": self.round_of_ts(now),
             "seeds": {str(k): v.hex()[:16] for k, v in sorted(self.seeds.items())[-4:]},
             "local_cells": len(self.local_bs),

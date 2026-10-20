@@ -36,7 +36,10 @@ int jp_sch_client(jp_sch *s, int fd,
 int jp_sch_server(jp_sch *s, int fd,
                   const uint8_t dsa_sk[JP_DSA44_SK_LEN]);
 
-/* один кадр = один вызов; seq-защита от replay внутри */
+/* один кадр = один вызов; seq-защита от replay внутри.
+ * buf = ПОЛНЫЕ байты wire-кадра (varint(total) + payload) — та же семантика,
+ * что у py-стороны (jproto_ref/secchan.py); recv() отдаёт pt такого же вида,
+ * дополнительной раскладки не требуется. */
 int jp_sch_send(jp_sch *s, const void *buf, size_t len);
 int jp_sch_recv(jp_sch *s, void *buf, size_t cap);
 

@@ -27,6 +27,7 @@ D_MIX = b"jproto.mix.1"        # onion-слои (route_digest)
 D_DIRLIST = b"jproto.dirlist.1"
 D_MSG = b"jproto.msg.1"        # AAD payload сообщения (зарезервирован)
 D_REC = b"jproto.rec.1"        # digest записи BS (новый домен — DESIGN_NOTES)
+D_SECCH = b"jproto.secch.1"    # secchan handshake/keys (wire.md §7, JP_DOM_SECCH)
 
 
 def H(x: bytes, tag: bytes = b"") -> bytes:
@@ -41,6 +42,28 @@ def h_pow(x: bytes) -> bytes:      return H(x, D_POW)
 def h_mix(x: bytes) -> bytes:      return H(x, D_MIX)
 def h_dirlist(x: bytes) -> bytes:  return H(x, D_DIRLIST)
 def h_rec(x: bytes) -> bytes:      return H(x, D_REC)
+
+
+def kdf_secch(ss: bytes, th: bytes) -> tuple[bytes, bytes, bytes, bytes]:
+    """K = SHAKE256(secch.1, ss ‖ th) 88 B → (key_c2s, nonce_c2s, key_s2c, nonce_s2c)."""
+    kb = hashlib.shake_256(D_SECCH + bytes(ss) + bytes(th)).digest(88)
+    return kb[:32], kb[32:44], kb[44:76], kb[76:88]
+
+
+# --- pk из sk-seed (python хранит sk как seed, см. module docstring) ----------
+
+def kem_pk_from_sk_seed(sk_seed: bytes) -> bytes:
+    """1184 B pk из 64 B seed-ключа ML-KEM-768."""
+    if not _HAS_ML:
+        raise ImportError("cryptography с ML-KEM недоступен")
+    return MLKEM768PrivateKey.from_seed_bytes(bytes(sk_seed)).public_key().public_bytes_raw()
+
+
+def dsa_pk_from_sk_seed(sk_seed: bytes) -> bytes:
+    """1312 B pk из 32 B seed-ключа ML-DSA-44."""
+    if not _HAS_ML:
+        raise ImportError("cryptography с ML-DSA недоступен")
+    return MLDSA44PrivateKey.from_seed_bytes(bytes(sk_seed)).public_key().public_bytes_raw()
 
 
 # Genesis seed(-1): детерминированная константа для вычисления seed(boot-раунда)

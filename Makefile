@@ -72,7 +72,11 @@ docker-down:
 e2e-ping: build/jpc
 	build/jpc ping --node 127.0.0.1:9101
 
+# E2E чат: два jchat-клиента (secchan + onion v2 + PoW) через fedA
+e2e-chat:
+	python/.venv/bin/python tools/e2e_chat.py 127.0.0.1:9101
+
 clean:
 	rm -rf build
 
-.PHONY: all tests clean docker-build docker-up docker-logs docker-down e2e-ping
+.PHONY: all tests clean docker-build docker-up docker-logs docker-down e2e-ping e2e-chat

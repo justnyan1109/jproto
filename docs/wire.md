@@ -98,10 +98,15 @@ T_PAD       0x001F   padding (CSPRNG)
 - `F_DIR_REQ`: (пусто). Ответ `F_DIR`: `T_DIR_DIGEST` ∥ `T_NODE_LIST`. Каждая
   `T_NODE_ENTRY` подписана ML-DSA-44 самим узлом: sig поверх
   `H(dirlist.1, TLV_entry_bytes)`.
-- `F_MIX_ONION`: `T_POW` ∥ `T_PAYLOAD` (onion layer или peeled rest).
-  Для hop→hop `T_POW` = PoW_node профиля POW_NODE; round берётся по seed(T_POW_PAR)?
-  Нет: round входит во вход через peeled слой (§5).
-- `F_BS_STORE`: `T_CELL_IDX` ∥ `T_CELL_REC` ∥ `T_POW` (профиль TRANSPORT).
+- `F_MIX_ONION`: `T_PAYLOAD` ∥ `T_POW` (порядок фактически свободный, TLV ищутся по типу).
+  **Cert — только на entry**: первый hop клиента к ноде n1 несёт T_POW
+  (профиль TRANSPORT, digest = H(pow.1, packet)); кадры hop→hop после peel идёт
+  БЕЗ T_POW (sealed по secchan; тарифицируются rate-limit 5 msg/s/IP как entry).
+  Опциональный POW_NODE внутри R — план BS-ноды, отдельный профиль (§6).
+- `F_BS_STORE`: `T_CELL_IDX` ∥ `T_CELL_REC` ∥ `T_POW` (профиль TRANSPORT;
+  digest = H(pow.1, idx ‖ rec), cert по seed раунда ±1). `T_CELL_REC` = value
+  (≥ ky+nonce+tag) ‖ score(u32) ‖ ts(u64) — хвост 12 B клиентский, нода
+  перезаписывает своим score при вставке.
 - `F_BS_READ`: `T_CELL_IDX` ∥ `T_POW` (профиль READ). Ответ `F_BS_READ_RESP`:
   0..50× `T_CELL_REC` (в порядке убывания score).
 - `F_ONLINE_DELIVER`: `T_PAYLOAD` = recipient-payload **неизменным** (узел не Decaps):
@@ -190,8 +195,17 @@ nonce = nonce_base; nonce[4..12] ^= u64_le(seq)
 AD    = "JPSFR" ‖ u64_le(seq)      (13 B)
 ```
 `seq` строго `+1` по каждому направлению (replay/loss → кадр отбрасывается,
-соединение помечается испорченным). BEACON- и GOSSIP-кадры заворачиваются
-в T_MSG_PT как единое целое их содержимого.
+соединение помечается испорченным). Плейнтекст `T_MSG_CT` = **полные байты
+wire-кадра** (`varint(total)` + payload) — канальная прозрачность: всё, что
+отправитель послал бы в plain TCP, зашифровывается как один blob. После
+расшифровки принимающая сторона читает кадр обычным кодеком.
+
+Принятие handshake (`F_SCH_HELLO` первым кадром соединения) переводит
+соединение в sealed-режим целиком; любой другой первый кадр остаётся plain
+(dev-совместимость клиентов, узкое место: plain_ok — конфиг ноды).
+
+Клиент проверяет pk ноды по TOFU-pin (жёстко после первого контакта);
+сервер проверяет только владение подписью клиента (транзитные пиры).
 
 
 ## 8. Beacon-кадры
