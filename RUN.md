@@ -50,10 +50,44 @@ cd python
 `--host/JP_HOST` (bind, деф. `0.0.0.0`), `--publish-host/JP_PUBLISH_HOST` (адрес в dir-entry, деф. `127.0.0.1`).
 Без аргументов и без JP_* — справка, exit 0. Зависимости: `cryptography` (см. `python/requirements.txt`).
 
-Beacon стартует с GENESIS-сид; через ~6 с от старта раунда появляется первый seed
-(раунды по 10 s: commit 0–3 s, reveal 3–6 s, finalize 6 s). Одинокая нода →
-seed «пролетает» (seed(n)=seed(n−1)), 3 ноды с peer'ами → полный k=3.
+Beacon привязан к стен-часу: метка раунда `⌊unix_ts/10⌋` (границы на круглых
+отметках). Расписание раунда: commit 0–3 s, reveal 3–6 s, слэк до границы;
+**seed(N+1) публикуется ровно на границе 10(N+1)** — «время доступности
+нового сида» всегда круглая отметка (после старта ноды — следующая граница,
+до неё сид от genesis). Одинокая нода → seed «пролетает»
+(seed(N+1)=seed(N)), 3 ноды с peer'ами → полный k=3.
 Сид для PoW-ключа часа — статичный DEV_SEED_HOUR (пока не привязан к beacon).
+
+## Dev-сессия: нода в docker + два ручных клиента (основной сценарий)
+
+```bash
+make net            # нода/фédерация в docker: fedA 9101, fedB 9102, fedC 9103
+                    # (= docker-up; после правок python/: make docker-restart)
+
+# терминал 1                      # терминал 2
+make chat-alice                   make chat-bob
+                                  # (NODE=127.0.0.1:9103 make chat-bob → fedC)
+
+make cards            # dev/alice.card, dev/bob.card (публичные, без sk)
+make id               # список dev/*.json (addr, размер pk)
+make status           # round/seff/bits_min/retention/n_active всех нод
+make docker-logs      # JSON-логи нод
+make docker-down
+```
+
+Внутри клиента (2 терминала):
+```
+# alice (наш терминал 1), получатель — bob:
+/to dev/bob.card       # или просто bob.card, если запускались из корня
+/msg привет
+# bob увидит: ← [HH:MM:SS sess=…] привет
+# bob: /reply привет-обратно
+/post заметка          # offline-доска часа (--keep ЧАСЫ при запуске = retention)
+/fetch                 # /fetch 1 — час назад
+```
+Первый запуск сам создаёт `dev/ИМЯ.json` (0600) и пины `dev/pins`; повторные
+— переиспользуют. Чат между нодами fedA/fedB: `/to card@2` (индекс из
+/nodes) — HOME ноды получателя; onion: наша нода → случайная → home.
 
 ## C-клиент (host)
 
@@ -67,9 +101,13 @@ build/jpc dir   --node 127.0.0.1:9102
 ## Мессенджер jchat (host, py-клиент)
 
 ```bash
-cd python && .venv/bin/python -m jproto_ref.chat keygen me.json
-.venv/bin/python -m jproto_ref.chat run --node 127.0.0.1:9101 --me me.json
+make net                                                       # ноды уже в docker
+make chat-alice                                                # или scripts/jchat.sh alice
+scripts/jchat.sh bob 127.0.0.1:9102                            # нода fedB
+make cards   → /to dev/bob.card[@Н] /msg ТЕКСТ /post /fetch /quit
 ```
+(ручной путь: `cd python && .venv/bin/python -m jproto_ref.chat keygen me.json`
+и `run --node 127.0.0.1:9101 --me me.json`.)
 
 Канал клиент↔нода: secchan (ML-KEM handshake; pk ноды TOFU-pin в
 `~/.jproto/node_pins.json`; несоответствие = отказ — MITM не пройдёт).
@@ -87,8 +125,10 @@ TRANSPORT-PoW по seed'у раунда (seed'ы и pow-параметры — �
   5 msg/s/IP (кадр посредника отличим не всегда — «вход сертифицирован,
   дальше доверие по валидному peel»).
 - **ONLINE-доставка**: py-нода отдаёт R всем HELLO-registered клиентам — вскрывает
-  только владелец sk; дест-адресации в R v2 нет (см. docs/wire.md §5).
-- **cell = h_cell(value)** для BS (payload-derived); inbox-адресация получателя — TODO.
+  только владелец sk (implicit rejection — фича, нода-владелец не знает, кто
+  «наш»); dest-адресация в R v2.1 есть для BS-route (ящик по dest).
+- **direct-BS доска**: cell = h_cell(board-часа) задаёт отправитель; onion-store
+  в dest-ящик (NODE-PoW, offline почта между нодами) — TODO в jchat.
 - py-kem sk = seed (64 B), C-sk = expanded (2400/2560 B): interop — по pk из dir;
   расшифка у владельца своим sk (конвертер seed↔expanded — отдельно, позже).
 - PoW-либа: `JPPOW_LIB` пуст → нода работает с PoW pass-through (skip_pow); для

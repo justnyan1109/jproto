@@ -1,9 +1,9 @@
-2026-10-20 05:31:30.108 DEBUG   asyncio selector_events.py:64: Using selector: EpollSelector
-2026-10-20 05:31:44.266 DEBUG   asyncio selector_events.py:64: Using selector: EpollSelector
-2026-10-20 05:31:46.389 ERROR   asyncio base_events.py:1891: Task exception was never retrieved
-future: <Task finished name='Task-25' coro=<Chat.read_loop() done, defined at /home/just/src/oc/junq-net/python/jproto_ref/chat.py:428> exception=RuntimeError('readexactly() called while another coroutine is already waiting for incoming data')>
+2026-10-20 05:40:38.387 DEBUG   asyncio selector_events.py:64: Using selector: EpollSelector
+2026-10-20 05:40:52.289 DEBUG   asyncio selector_events.py:64: Using selector: EpollSelector
+2026-10-20 05:40:55.288 ERROR   asyncio base_events.py:1891: Task exception was never retrieved
+future: <Task finished name='Task-29' coro=<Chat.read_loop() done, defined at /home/just/src/oc/junq-net/python/jproto_ref/chat.py:434> exception=RuntimeError('readexactly() called while another coroutine is already waiting for incoming data')>
 Traceback (most recent call last):
-  File "/home/just/src/oc/junq-net/python/jproto_ref/chat.py", line 431, in read_loop
+  File "/home/just/src/oc/junq-net/python/jproto_ref/chat.py", line 437, in read_loop
     fr = await self.sec.recv_frame()
          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
   File "/home/just/src/oc/junq-net/python/jproto_ref/secchan.py", line 126, in recv_frame
@@ -19,7 +19,7 @@ Traceback (most recent call last):
         f'{func_name}() called while another coroutine is '
         f'already waiting for incoming data')
 RuntimeError: readexactly() called while another coroutine is already waiting for incoming data
-2026-10-20 05:31:46.561 DEBUG   asyncio selector_events.py:64: Using selector: EpollSelector
-2026-10-20 05:31:48.571 DEBUG   asyncio selector_events.py:64: Using selector: EpollSelector
-2026-10-20 05:31:55.615 DEBUG   asyncio selector_events.py:64: Using selector: EpollSelector
-2026-10-20 05:31:55.618 DEBUG   asyncio selector_events.py:64: Using selector: EpollSelector
+2026-10-20 05:40:55.328 DEBUG   asyncio selector_events.py:64: Using selector: EpollSelector
+2026-10-20 05:40:57.343 DEBUG   asyncio selector_events.py:64: Using selector: EpollSelector
+2026-10-20 05:41:04.426 DEBUG   asyncio selector_events.py:64: Using selector: EpollSelector
+2026-10-20 05:41:04.430 DEBUG   asyncio selector_events.py:64: Using selector: EpollSelector

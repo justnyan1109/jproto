@@ -4,3 +4,6 @@ python/.pytest_cache
 python/.venv
 python/pytest.log
 vendor/RandomX/
+
+# dev-клиенты (идентичности/пины jchat)
+dev/

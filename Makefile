@@ -76,7 +76,42 @@ e2e-ping: build/jpc
 e2e-chat:
 	python/.venv/bin/python tools/e2e_chat.py 127.0.0.1:9101
 
+# ---- dev-чат: docker-ноды + 2 ручных клиента (scripts/jchat.sh) -------------
+PYV    := python/.venv/bin/python
+JCHAT  := scripts/jchat.sh
+
+$(PYV):
+	python3 -m venv python/.venv
+	$(PYV) -m pip install -q -r python/requirements.txt
+
+docker-restart: docker-build docker-up    ## пересборка образа + перезапуск нод
+
+net: docker-up                            ## = docker-up (нода в докере)
+
+chat-alice:   ## клиент №1 (идентичность dev/alice.json, нода fedA)
+	$(JCHAT) alice
+
+chat-bob:     ## клиент №2 (dev/bob.json; NODE=host:port чтобы к другой ноде)
+	$(JCHAT) bob $(NODE)
+
+chat-c:       ## клиент №3 у fedC (для кросс-федерации A→C)
+	$(JCHAT) carl 127.0.0.1:9103
+
+id:           ## карточки идентичностей dev/*.json (addr + размер pk)
+	@for f in dev/*.json; do [ -f "$$f" ] || continue; \
+		$(PYV) -c "import json; d=json.load(open('$$f')); print(f\"$$f  addr={d['addr'][:16]}…  pk={len(d['pk_kem'])//2}B\")"; done
+
+cards:        ## публичные карточки dev/*.card (можно передавать собеседнику)
+	@mkdir -p dev
+	@for f in dev/[a-z]*.json; do [ -f "$$f" ] || { echo "нет dev/*.json (make chat-alice создаст)"; break; }; \
+		n=$$(basename $$f .json); PYTHONPATH=python $(PYV) -m jproto_ref.chat card $$f > dev/$$n.card; \
+		echo "dev/$$n.card → /to dev/$$n.card"; done
+
+status:       ## /status всех нод федерации
+	@for p in 9201 9202 9203; do echo "== fed$$(printf %d $$((p-9200))):"; \
+		curl -sf http://127.0.0.1:$$p/status | $(PYV) -c "import json,sys;d=json.load(sys.stdin);print({k:d[k] for k in ('round','seff','bits_min','retention_est_h','n_active','local_recs','global_recs') if k in d})"; done
+
 clean:
 	rm -rf build
 
-.PHONY: all tests clean docker-build docker-up docker-logs docker-down e2e-ping e2e-chat
+.PHONY: all tests clean docker-build docker-up docker-restart docker-logs docker-down e2e-ping e2e-chat chat-alice chat-bob chat-c id status net

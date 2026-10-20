@@ -138,16 +138,22 @@ def _parse_entry(val: bytes) -> dict | None:
 
 
 def _resolve_recipient(spec: str) -> tuple[bytes, bytes]:
-    """PK получателя: 2368-hex (pk_kem) либо путь к файлу идентичности.
+    """PK получателя: 2368-hex (pk_kem) либо путь к файлу идентичности
+    (полной) или карточке (только pk_kem/pk_dsa/addr — см. `jchat card`).
     Возвращает (pk, addr). NOTE: 64-hex addr необратим — отправителю нужен pk."""
     spec = spec.strip()
     if os.path.isfile(spec):
-        ident = Identity.load(spec)
-        return ident.pk_kem, ident.addr
+        with open(spec) as f:
+            d = json.load(f)
+        pk = bytes.fromhex(d["pk_kem"])
+        addr = bytes.fromhex(d["addr"]) if d.get("addr") else C.h_dir(pk)
+        if len(pk) != C.KEM_PK_LEN:
+            raise ValueError(f"{spec}: bad pk")
+        return pk, addr
     raw = bytes.fromhex(spec)
     if len(raw) == C.KEM_PK_LEN:
         return raw, C.h_dir(raw)
-    raise ValueError("recipient: 2368-hex pk_kem либо файл идентичности")
+    raise ValueError("recipient: 2368-hex pk_kem либо файл идентичности/карточка")
 
 
 def board_cell(addr: bytes, hour: int) -> bytes:
@@ -460,9 +466,9 @@ HELP_TXT = """команды:
   /me              — мой адрес + подключение
   /nodes           — dir-ноды [индекс] host:port addr…
   /seed            — текущий раунд/seed
-  /to CARD[@HOME]  — получатель: КОМПАКТ-карта = файл идентичности ИЛИ pk (2368 hex);
-                     HOME = индекс его ноды (см. /nodes) или host:port;
-                     без HOME — наша нода (same-node чат)
+  /to CARD[@HOME]  — получатель: КОМПАКТ-карта = карточка (без sk) ИЛИ файл
+                     идентичности ИЛИ pk (2368 hex); HOME = индекс его ноды
+                     (см. /nodes) или host:port; без HOME — наша нода
   /msg ТЕКСТ       — послать ТЕКСТ получателю (onion 3 hop + PoW ≈1 с)
   ТЕКСТ            — шорткат /msg (после /to)
   /post ТЕКСТ      — direct-BS в мою почтовую ячейку часа (offline-заметка себе)
@@ -607,6 +613,10 @@ def _cli() -> int:
     pk = sub.add_parser("keygen", help="создать файл идентичности")
     pk.add_argument("file")
 
+    pc = sub.add_parser("card", help="публичная карточка (stdout; без sk) — то,\n"
+                                     "что передаётся собеседнику в /to")
+    pc.add_argument("file")
+
     pr = sub.add_parser("run", help="интерактивный чат")
     pr.add_argument("--node", required=True, metavar="HOST:PORT")
     pr.add_argument("--me", required=True, metavar="IDFILE")
@@ -631,6 +641,12 @@ def _cli() -> int:
         ident = Identity.generate()
         ident.save(a.file)
         print(f"identity → {a.file}  addr={ident.addr.hex()}")
+        return 0
+    if a.cmd == "card":
+        ident = Identity.load(a.file)
+        json.dump({"pk_kem": ident.pk_kem.hex(), "pk_dsa": ident.pk_dsa.hex(),
+                   "addr": ident.addr.hex()}, sys.stdout, indent=1)
+        print()
         return 0
 
     pin_dir = a.pin_dir or os.path.expanduser("~/.jproto")
