@@ -192,6 +192,7 @@ class Chat:
         self.alive = False
         self.last_incoming: str = ""
         self._bs_fut: asyncio.Future | None = None
+        self._seed_fut: asyncio.Future | None = None
 
         # PoW
         self.pow_ok = JP.load_lib() is not None
@@ -264,22 +265,56 @@ class Chat:
             pass
 
     async def _refresh_seeds_retry(self, tries: int = 10, pause: float = 1.0) -> None:
-        await self.sec.send(W.F_SEED_REQ)
-        fr = await self.sec.recv_frame()
-        if fr is None or fr.type != W.F_SEED:
-            raise ConnectionError("no SEED answer")
-        err = W.get(fr.tvs, W.T_ERR)
-        if err:
-            if tries <= 0:
-                raise ConnectionError("SEED 503: beacon ещё не финализировал раунд")
-            await asyncio.sleep(pause)
-            return await self._refresh_seeds_retry(tries - 1, pause)
-        tvs = fr.tvs
-        for i in range(0, len(tvs) - 1, 2):
-            if tvs[i][0] == W.T_ROUND and tvs[i + 1][0] == W.T_SEED:
-                self.seeds[W.as_u64(tvs[i][1])] = tvs[i + 1][1]
-        if self.seeds:
-            self.round = max(self.seeds)
+        # между REQ и ответом могут вклиниться броадкасты F_BEACON_SEED —
+        # абсорбируем их, не-F_SEED кадры пропускаем (read_loop ещё не пущен)
+        for _ in range(12):
+            await self.sec.send(W.F_SEED_REQ, 0, [])
+            fr = await self.sec.recv_frame()
+            if fr is None:
+                raise ConnectionError("no SEED answer")
+            if fr.type == W.F_BEACON_SEED:
+                n = W.as_u64(W.get(fr.tvs, W.T_ROUND))
+                s = W.get(fr.tvs, W.T_SEED)
+                if n is not None and s:
+                    self.seeds[n] = s
+                    self.round = max(self.seeds)
+                continue
+            if fr.type != W.F_SEED:
+                continue
+            err = W.get(fr.tvs, W.T_ERR)
+            if err:
+                if tries <= 0:
+                    raise ConnectionError("SEED 503: beacon ещё не финализировал раунд")
+                await asyncio.sleep(pause)
+                return await self._refresh_seeds_retry(tries - 1, pause)
+            tvs = fr.tvs
+            for i in range(0, len(tvs) - 1, 2):
+                if tvs[i][0] == W.T_ROUND and tvs[i + 1][0] == W.T_SEED:
+                    self.seeds[W.as_u64(tvs[i][1])] = tvs[i + 1][1]
+            if self.seeds:
+                self.round = max(self.seeds)
+                return
+        raise ConnectionError("нет F_SEED (кадры не те)")
+
+    async def _seed_fresh(self) -> None:
+        """Свежесть сидов перед минингом: F_BEACON_SEED долетает от ноды
+        (броадкаст клиентам), но при лагах/расхождении — тихо программно
+        перезапрашиваем F_SEED_REQ (ответ идёт через читатель-поток)."""
+        now_lbl = int(time.time() // 10)
+        if self.seeds and max(self.seeds) >= now_lbl - 1:
+            return
+        for _ in range(2):
+            fut = asyncio.get_running_loop().create_future()
+            self._seed_fut = fut
+            try:
+                await self.sec.send(W.F_SEED_REQ, 0, [])
+                await asyncio.wait_for(fut, 5.0)
+                if self.seeds and max(self.seeds) >= now_lbl - 1:
+                    return
+            finally:
+                self._seed_fut = None
+            await asyncio.sleep(0.3)
+        self.out("!! сиды не догнали текущий раунд — нода может срезать пакет")
 
     # --- внутренности PoW --------------------------------------------------------
 
@@ -348,6 +383,7 @@ class Chat:
                        recip_pk, pt)
         route = self._route_online(home)
         packet = R.build_onion(rpl, [(e["addr"], e["pk_kem"]) for e in route])
+        await self._seed_fresh()
         nonce, bits = self.mine_cert(packet, W.POW_TRANSPORT)
         cert = W.enc_pow_cert(nonce, bits, W.POW_TRANSPORT)
         await self.sec.send(W.F_MIX_ONION, 0, [
@@ -384,6 +420,7 @@ class Chat:
         value = ky + nonce + msg_ct
         hour = self._hour()
         idx = board_cell(self.ident.addr, hour)
+        await self._seed_fresh()
         rec = value + W.u32(0) + W.u64(0)          # хвост (score/ts) у ноды заново
         bits_keep = self.retention_bits(keep_h)
         nonce_p, bits = self.mine_cert(idx + rec, W.POW_TRANSPORT,
@@ -394,6 +431,7 @@ class Chat:
         return hour
 
     async def fetch(self, back_hours: int = 0) -> list[str]:
+        await self._seed_fresh()
         hour = self._hour() - max(0, int(back_hours))
         idx = board_cell(self.ident.addr, hour)
         nonce, bits = self.mine_cert(idx, W.POW_READ)
@@ -459,6 +497,18 @@ class Chat:
                 # ответ доски: ждущий /fetch забирает через _bs_fut
                 # (читатель потока один — иначе RuntimeError readexactly)
                 f = self._bs_fut
+                if f is not None and not f.done():
+                    f.set_result(fr)
+            elif fr.type == W.F_SEED:
+                # сиды: обновление фона ноды бикон + ответ на наш REQ
+                for i in range(0, len(fr.tvs) - 1, 2):
+                    if fr.tvs[i][0] == W.T_ROUND and fr.tvs[i + 1][0] == W.T_SEED:
+                        n = W.as_u64(fr.tvs[i][1])
+                        if n is not None and fr.tvs[i + 1][1]:
+                            self.seeds[n] = fr.tvs[i + 1][1]
+                if self.seeds:
+                    self.round = max(self.seeds)
+                f = self._seed_fut
                 if f is not None and not f.done():
                     f.set_result(fr)
             elif fr.type in (W.F_ONLINE_ACK, W.F_BEACON_SEED, W.F_GOSSIP_DATA,

@@ -1046,7 +1046,13 @@ class Node:
             self.emergency.discard(n)
         tvs = [(W.T_ROUND, W.u64(n)), (W.T_SEED, seed)]
         tvs += [(W.T_PK_DSA, pk) for pk in pks]
-        self._bcast_nodes(W.build_frame(W.F_BEACON_SEED, 0, tvs))
+        frame = W.build_frame(W.F_BEACON_SEED, 0, tvs)
+        self._bcast_nodes(frame)
+        # клиентам тоже: иначе TUI-сессии сидят на устаревшем сиде
+        # (окно verify (n−1,n,n+1) промахивается → mix_drop_pow)
+        for sc in list(self.sessions.values()):
+            if sc.kind == "client" and not sc.closed:
+                asyncio.ensure_future(sc.send(frame))
 
     def _absorb_seed(self, n: int, seed: bytes, quorum: int, src: str) -> None:
         """Единое правило принятия сида (консистентность сети §8):
