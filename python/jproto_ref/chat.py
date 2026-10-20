@@ -191,6 +191,7 @@ class Chat:
         self.seq: int = 0
         self.alive = False
         self.last_incoming: str = ""
+        self._bs_fut: asyncio.Future | None = None
 
         # PoW
         self.pow_ok = JP.load_lib() is not None
@@ -399,7 +400,15 @@ class Chat:
         cert = W.enc_pow_cert(nonce, bits, W.POW_READ)
         await self.sec.send(W.F_BS_READ, 0, [
             (W.T_CELL_IDX, idx), (W.T_POW, cert)])
-        fr = await self.sec.recv_frame()
+        # читает фоновый read_loop (double-read = RuntimeError readexactly)
+        fut = asyncio.get_running_loop().create_future()
+        self._bs_fut = fut
+        try:
+            fr = await asyncio.wait_for(fut, 10.0)
+        except TimeoutError:
+            raise ConnectionError("нет ответа на READ (таймаут)")
+        finally:
+            self._bs_fut = None
         if fr is None or fr.type != W.F_BS_READ_RESP:
             raise ConnectionError("нет ответа на READ")
         out: list[str] = []
@@ -446,6 +455,12 @@ class Chat:
                         self.last_incoming = txt
                         meta = W.recipient_header(rpl)
                         self.out(f"  ← [{_now_hhmmss()} sess={meta['session'] & 0xFFFF:04x}] {txt}")
+            elif fr.type == W.F_BS_READ_RESP:
+                # ответ доски: ждущий /fetch забирает через _bs_fut
+                # (читатель потока один — иначе RuntimeError readexactly)
+                f = self._bs_fut
+                if f is not None and not f.done():
+                    f.set_result(fr)
             elif fr.type in (W.F_ONLINE_ACK, W.F_BEACON_SEED, W.F_GOSSIP_DATA,
                              W.F_BEACON_COMMIT, W.F_BEACON_REVEAL, W.F_MIX_ACK):
                 if fr.type == W.F_BEACON_SEED:
