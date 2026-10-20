@@ -43,21 +43,31 @@ C-эталон тех же примитивов, `docker/compose.yml` — фед
 (задержка 1–3 c), Local BS, Global BS. Клиентские onion всегда 3 хопа; третий —
 home получателя (online/Local) или случайная нода (Global).
 
-```
-┌────────────────┐                  ┌───────────────────────────────┐
-│ КЛИЕНТ A (TUI) │ ═secchan (PQ) ═▶ │ ФЕДЕР. A                      │
-└────────────────┘                  │ beacon · mix · LocalBS · GBS  │
-                                    └───────┬───────────────────────┘
-                                            │ secchan нода↔нода
-                          ┌─────────────────▼─────────────────┐
-    gossip Global BS      │       peer-сеть федераций         │
-  ◀───────────────────────┤  A ↔ B ↔ C   (dir-реестр общий)   │
-                          └─────────────────┬─────────────────┘
-                                            ▼
-              ┌──────────────────────────────────────────────┐
-              │ ФЕДЕР. B (home получателя B)                 │
-              │ online → B   offline → Local/Global BS       │
-              └──────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    CA["Клиент A (TUI jchat)"]
+
+    subgraph FedA["Федерация A (entry)"]
+        FA["beacon · mix · LocalBS · GlobalBS"]
+    end
+    subgraph FedB["Федерация B (middle)"]
+        FB["beacon · mix · LocalBS · GlobalBS"]
+    end
+    subgraph FedC["Федерация C (home B)"]
+        FC["beacon · mix · LocalBS · GlobalBS"]
+    end
+
+    CA ==secchan==>|"1. onion + TRANSPORT PoW"| FA
+    FA -->|"хоп 1→2 (delay 1–3 c)"| FB
+    FB -->|"хоп 2→3: home (online / Local BS)"| FC
+
+    FC -->|"B online: F_ONLINE_DELIVER"| CB["Клиент B"]
+    FC -.->|"B offline (roadmap)"| FCLight["Local BS вставка"]
+
+    FA <-.->|"gossip Global BS"| FB
+    FB <-.-> FC
+    FA <-.->|"beacon commit/reveal в каждом раунде"| FB
+    FB <-.->|"~10 c"| FC
 ```
 
 Сравнение с оригиналом: ✅ архитектура совпадает; ➕ secchan, dir-реестр,
@@ -85,7 +95,7 @@ HTTP-status, BS-контроллер; ⚠️ PoW_node на mix-пересылк�
   кворумом ≥2 (или замена на emergency-метке) перезаписывает локальный
   (`_absorb_seed`, события `seed_supersede`/`seed_mismatch` в логах).
 
-```
+```mermaid
 sequenceDiagram
     participant A as Федерация A
     participant B as Федерация B
@@ -119,7 +129,7 @@ Verify-окно PoW: нода принимает cert, добытый по лю�
 Клиент добывает **один TRANSPORT-PoW** на весь маршрут; проверяет его входная
 нода. Маршрут всегда 3 хопа: `[наша нода, случайная из dir, home получателя]`.
 
-```
+```mermaid
 sequenceDiagram
     participant A as Клиент A
     participant FA as Федерация A (entry)
@@ -174,7 +184,7 @@ sequenceDiagram
 - Global BS реплицируется gossip-циклом (каждый тик нода шлёт peer по одной
   свежей ячейке).
 
-```
+```mermaid
 sequenceDiagram
     participant A as Клиент A
     participant Mix as onion [наша, random, target]
@@ -184,7 +194,8 @@ sequenceDiagram
     A->>A: R(I_STORE_LOCAL|GLOBAL, dest=pk_B, NODE-PoW в hdr) → onion + TRANSPORT cert
     A->>Mix: F_MIX_ONION
     Mix->>T: hop-пересылки (delay 1..3 c)
-    T->>T: final peel → NODE-PoW verify → вставка в local_bs/gbs[dest]
+    T->>T: final peel → NODE-PoW verify
+    T->>T: вставка в local_bs[{LOCAL}] / global_bs[{GLOBAL}] по dest
     Note over T: score/bits + τ-декей; полная ячейка → вытеснение (§6)
     B->>T: F_BS_READ {cell=dest, READ cert}  (прямое подключение)
     T-->>B: записи {ky_ct, msg_ct, bits, ts} → B вскрывает своим sk
@@ -207,7 +218,7 @@ Direct-пути (без onion) — «почта себе» и отладочны
 `/post` (TRANSPORT cert) и `/fetch N` (READ cert). Час ячейки = текущий счётчик
 beacon-раундов (360 раундов = час, границы совпадают с сидом).
 
-```
+```mermaid
 sequenceDiagram
     participant A as Клиент (сам себе)
     participant FA as Своя нода (= home)
@@ -238,6 +249,18 @@ sequenceDiagram
 Ячейка вмещает `cell_size` записей (50 в dev). Есть свободное место — вставка без
 проверок; полная — новое сообщение сравнивается score с самым слабым: сильнее —
 вытесняет, слабее — отклоняется. Отдельного TTL нет: живёт, пока не вытеснят.
+
+```mermaid
+flowchart TD
+    M["Входящее сообщение M: bits(M), ts(M)"] --> FLOOR{"bits(M) < bits_min?"}
+    FLOOR -- да --> F402["err 402 — отклонить"]
+    FLOOR -- нет --> CAP{"ячеек < 50?"}
+    CAP -- да --> INS["вставить M"]
+    CAP -- нет --> SCORE["score = bits × decay(возраст), τ = 168 ч"]
+    SCORE --> WEAK{"score(M) > min score ячейки?"}
+    WEAK -- да --> EV["вытеснить слабейшую → вставить"]
+    WEAK -- нет --> REJ["отклонить M"]
+```
 
 - `score = bits × decay(age)`, τ_h = 168 ч (7 дней).
 - ➕ admission floor: запись ниже `bits_min` отклоняется всегда (`err 402`),
