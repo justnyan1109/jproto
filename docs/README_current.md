@@ -57,7 +57,7 @@ flowchart TB
         FC["beacon · mix · LocalBS · GlobalBS"]
     end
 
-    CA ==secchan==>|"1. onion + TRANSPORT PoW"| FA
+    CA -->|"secchan · 1. onion + TRANSPORT PoW"| FA
     FA -->|"хоп 1→2 (delay 1–3 c)"| FB
     FB -->|"хоп 2→3: home (online / Local BS)"| FC
 
@@ -137,7 +137,7 @@ sequenceDiagram
     participant FC as Федерация C (home B)
     participant B as Клиент B
 
-    Note over A: сиды свежие сами: F_BEACON_SEED броадкастится;
+    Note over A: сиды свежие сами — F_BEACON_SEED броадкастится
     Note over A: отстал — тихий F_SEED_REQ → F_SEED (future, без гонок)
     A->>A: R(I_ONLINE, session, seq, pk_B) → onion [FA, FB, FC]
     A->>A: cert = mine(seed(N+1), H_pow(packet), ≥bits_min)
@@ -148,7 +148,7 @@ sequenceDiagram
     FB->>FB: delay 1..3 c → FC: hop   ⚠ без PoW_node, rate-limited
     FC->>FC: финальный peel → R(I_ONLINE)
     FC-->>B: F_ONLINE_DELIVER {R} — всем HELLO-registered на этой ноде
-    Note over B: владелец sk вскрывает; прочие выбрасывают молча (implicit rejection)
+    Note over B: владелец sk вскрывает, прочие выбрасывают молча (implicit rejection)
 ```
 
 Детали: транспортный digest = `H_pow(packet)`; ключ RandomX — `seed_hour` (dev
@@ -196,7 +196,7 @@ sequenceDiagram
     Mix->>T: hop-пересылки (delay 1..3 c)
     T->>T: final peel → NODE-PoW verify
     T->>T: вставка в local_bs[{LOCAL}] / global_bs[{GLOBAL}] по dest
-    Note over T: score/bits + τ-декей; полная ячейка → вытеснение (§6)
+    Note over T: score/bits + τ-декей (§6), полная ячейка → вытеснение
     B->>T: F_BS_READ {cell=dest, READ cert}  (прямое подключение)
     T-->>B: записи {ky_ct, msg_ct, bits, ts} → B вскрывает своим sk
 ```
