@@ -37,8 +37,10 @@
 #define JP_ADDR_LEN          32
 #define JP_SALT_LEN          64
 #define JP_RPL_HDR_LEN       (2+1+1+4+4+8+1+1+2)  /* 24: magic,ver,itype,session,seq,pow_nonce,pow_bits,pow_prof,body_len */
-#define JP_MSG_PAYLOAD_MAX   5888                 /* plaintext-msg; R(len) = 24+1088+12+5888+16 = 7028 */
-#define JP_RPL_LEN_FIXED     (JP_RPL_HDR_LEN + JP_KEM768_CT_LEN + JP_AEAD_NONCE_LEN + JP_MSG_PAYLOAD_MAX + JP_AEAD_TAG_LEN)
+#define JP_RPL_DEST_LEN      32                   /* R v2.1: cell-индекс BS (смесь), 0^32 = legacy h_cell(value) */
+#define JP_RPL_HDR_LEN_FULL  (JP_RPL_HDR_LEN + JP_RPL_DEST_LEN)   /* 56 */
+#define JP_MSG_PAYLOAD_MAX   5856                 /* R(len) = 56+1088+12+5856+16 = 7028 (−32 B: dest) */
+#define JP_RPL_LEN_FIXED     (JP_RPL_HDR_LEN_FULL + JP_KEM768_CT_LEN + JP_AEAD_NONCE_LEN + JP_MSG_PAYLOAD_MAX + JP_AEAD_TAG_LEN)
 #define JP_ONION_LAYER_ADD   (JP_ADDR_LEN + 2 + JP_KEM768_CT_LEN + JP_AEAD_NONCE_LEN + JP_AEAD_TAG_LEN) /* 1150 */
 #define JP_ONION_MAX_LEN     (JP_KEM768_CT_LEN + JP_AEAD_NONCE_LEN + JP_AEAD_TAG_LEN + JP_ADDR_LEN + 2 \
                               + JP_RPL_LEN_FIXED + (JP_ONION_MAX_LAYERS-1)*JP_ONION_LAYER_ADD)           /* 11628 */

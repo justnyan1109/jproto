@@ -25,7 +25,7 @@ from . import crypto as C
 from . import wire as W
 
 RPL_LEN_FIXED   = W.RPL_LEN_FIXED          # 7028
-RPL_HDR_LEN     = W.RECIPIENT_HDR_LEN      # 24
+RPL_HDR_LEN     = W.RECIPIENT_HDR_LEN      # 56 (core 24 + dest 32)T_HDR_LEN      # 24
 MSG_PAYLOAD_MAX = W.MSG_PAYLOAD_MAX        # 5888
 BLOB_BASE       = W.BLOB_BASE              # 7090
 LAYER_ADD       = W.ONION_LAYER_ADD        # 1150
@@ -124,8 +124,10 @@ def build_onion(rpl: bytes, route: list[tuple[bytes, bytes]]) -> bytes:
 # --- R: encode / parse ----------------------------------------------------------
 
 def encode(itype: int, session: int, seq: int, pow_nonce: int,
-           pow_bits: int, pow_prof: int, pk_recip: bytes, msg: bytes) -> bytes:
-    """msg → полный R (7028 B): encaps + AEAD + CSPRNG-паддинг."""
+           pow_bits: int, pow_prof: int, pk_recip: bytes, msg: bytes,
+           dest: bytes | None = None) -> bytes:
+    """msg → полный R (7028 B): encaps + AEAD + CSPRNG-паддинг. dest —
+    32 B cell-индекс для BS-ноды (R v2.1); None → 0^32 (cell от payload)."""
     msg = bytes(msg)
     if not 1 <= len(msg) <= MSG_PAYLOAD_MAX:
         raise ValueError(f"msg len {len(msg)} не в 1..{MSG_PAYLOAD_MAX}")
@@ -133,12 +135,12 @@ def encode(itype: int, session: int, seq: int, pow_nonce: int,
     nonce = os.urandom(NONCE_LEN)
     msg_ct = C.aead_encrypt(ss, nonce, msg_aad(itype, session, seq), msg)
     return assemble(itype, session, seq, pow_nonce, pow_bits, pow_prof,
-                    ky, nonce, msg_ct)
+                    ky, nonce, msg_ct, dest=dest)
 
 
 def assemble(itype: int, session: int, seq: int, pow_nonce: int,
              pow_bits: int, pow_prof: int, ky_ct: bytes, aead_nonce: bytes,
-             msg_ct: bytes) -> bytes:
+             msg_ct: bytes, dest: bytes | None = None) -> bytes:
     """Из готовых компонентов → R (заполнение CSPRNG до 7028)."""
     body = bytes(ky_ct) + bytes(aead_nonce) + bytes(msg_ct)
     if len(body) != KEM_CT + NONCE_LEN + len(msg_ct):
@@ -146,7 +148,7 @@ def assemble(itype: int, session: int, seq: int, pow_nonce: int,
     if not TAG_LEN <= len(msg_ct) <= MSG_PAYLOAD_MAX + TAG_LEN:
         raise ValueError("msg_ct out of range")
     hdr = W.enc_recipient_header(itype, session, seq, pow_nonce, pow_bits,
-                                 pow_prof, len(body))
+                                 pow_prof, len(body), dest=dest)
     pad = len(hdr) + len(body)
     if pad > RPL_LEN_FIXED:
         raise ValueError("R overflow")
@@ -156,12 +158,12 @@ def assemble(itype: int, session: int, seq: int, pow_nonce: int,
 
 
 def parse(r: bytes) -> dict:
-    """R → meta + body-слайсы (copy=False: bytes → bytes(value))."""
+    """R → meta + body-слайсы. body_off = полный заголовок 56 (core+dest)."""
     r = bytes(r)
     if len(r) != RPL_LEN_FIXED:
         raise ValueError(f"R len {len(r)} != {RPL_LEN_FIXED}")
     meta = W.recipient_header(r)
-    body_off = RPL_HDR_LEN
+    body_off = W.RECIPIENT_HDR_LEN
     body = r[body_off: body_off + meta["body_len"]]
     return {**meta,
             "ky_ct": body[:KEM_CT],
@@ -176,8 +178,23 @@ def value_of(rpl_dict: dict) -> bytes:
 
 
 def cell_of(rpl_dict: dict) -> bytes:
-    """Ячейка BS: h_cell(value) — выводится нодой без расшифровки msg (dev)."""
+    """Ячейка BS-ноды: dest из заголовка (R v2.1); 0^32 → h_cell(value)
+    (совместимость с R v2.0)."""
+    d = rpl_dict.get("dest") or b"\x00" * 32
+    if d != b"\x00" * 32:
+        return bytes(d)
     return C.h_cell(value_of(rpl_dict))
+
+
+def pow_digest_rpl(rpl: bytes) -> bytes:
+    """NODE-PoW digest КАНОНИЧНО: H(pow.1, R с обнулённым полем pow_nonce).
+    Нонс попадать в свой digest не может (chicken-egg): клиент майнит по
+    zero-nonce R, нода верифицирует так же (обнуляя поле перед хэшем)."""
+    b = bytearray(bytes(rpl))
+    if len(b) != W.RPL_LEN_FIXED:
+        raise ValueError("R len")
+    b[12:20] = b"\x00" * 8
+    return C.h_pow(bytes(b))
 
 
 def decaps_msg(kem_sk_seed: bytes, parsed: dict, itype: int,

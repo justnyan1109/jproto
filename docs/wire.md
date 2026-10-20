@@ -88,6 +88,7 @@ T_CAPS      0x001A   u32 capabilities bitmap
 T_COMMIT    0x001B   32 B commit beacon-участника
 T_DIR_DIGEST 0x001C  32 B digest директории
 T_PAD       0x001F   padding (CSPRNG)
+T_STOR_PAR  0x0022   статистика хранения ноды (24 B, §6a)
 ```
 
 ## 4. Состав кадров (минимальный список TLV)
@@ -135,18 +136,25 @@ packet(L)                   = 1088 + blob(L):  L=3 → 10478,  L=4 → 11628
 `ctl = 1088` у промежуточных слоёв, `0` — у финального; это единственная метка
 «последний слой» (контроль магии R catcher'ом BS/адресата).
 
-Recipient-payload R (7028 B):
+Recipient-payload R (7028 B, **v2.1**):
 ```
-hdr 24 B: magic u16 'JP', ver u8=1, itype u8, session u32, seq u32,
-          pow_nonce u64 LE, pow_bits u8, pow_prof u8, body_len u16
-body:     kyber_ct(1088) ‖ aead_nonce(12) ‖ msg_ct(msg+tag16)
-tail:     CSPRNG padding до 7028 (в body_len не входит)
+hdr 24 B:   magic u16 'JP', ver u8=1, itype u8, session u32, seq u32,
+            pow_nonce u64 LE, pow_bits u8, pow_prof u8, body_len u16
+dest 32 B:  cell-индекс BS-ноды (0^32 = legacy: cell = h_cell(value))
+body:       kyber_ct(1088) ‖ aead_nonce(12) ‖ msg_ct(msg+tag16)
+tail:       CSPRNG padding до 7028 (в body_len не входит)
 ```
+max длина msg сужена до **5856** B (−32 за счёт dest; |R| и длины
+blob/packet не изменились: L3 → 10478, L4 → 11628). dest не входит в AD
+сообщения — получатель расшифровывает как раньше; BS-нода кладёт запись в
+`dest` без вычисления h_cell. dest зад отправитель до майнинга NODE-cert —
+в «круг» дайджеста не попадает.
 
 msg_ct = AEAD(ss_msg, AD = itype‖session‖seq (9 B), plaintext = msg), ss_msg —
 свежий ML-KEM-768 `Encaps(pk_B)`. PoW-сертификаты: TRANSPORT-профиль (nonce/bits)
 идёт TLV `T_POW` наружного кадра F_MIX_ONION (дайджест = H(pow.1, packet));
-NODE-профиль живёт в заголовке R (дайджест = H(pow.1, R)) — детали §6.
+NODE-профиль живёт в заголовке R (дайджест — каноничный, с нулевым
+pow_nonce — детали §6).
 
 ## 6. PoW cert (T_POW)
 
@@ -163,11 +171,39 @@ input = seed_round(32) ‖ payload_digest(32) ‖ nonce)`, требование 
 | профиль | payload_digest = | кто проверяет | где nonce |
 |---|---|---||
 | TRANSPORT | H(pow.1, onion-пакет целиком) | entry-нода n1 (анти-flood) | TLV T_POW наружного кадра |
-| NODE | H(pow.1, R 7028 B) | BS-нода nL (storage-скора/квота) | байт 12..20 заголовка R |
+| NODE | H(pow.1, R с **обнулённым** байтовым полем 12..20) | BS-нода nL (storage-скора/квота) | байт 12..20 заголовка R |
 | READ | H(pow.1, read-запрос) | BS при чтении | T_POW кадра запроса |
+
+NODE-нормализация: nonce не может входить в свой собственный digest
+(chicken-egg) — клиент майнит по R с нулевым pow_nonce, затем вписывает
+найденное значение в байты 12..20; верификация обнуляет поле перед хэшем.
+DEST (32 B, байты 24..56 R) известен до майнинга — в нормализацию не входит.
 
 Пересчёт в payload_digest записи изменять нельзя — PoW сертифицирует
 конкретный пакет (переиспользование с другим payload недопустимо).
+
+## 6a. Опубликованная статистика хранения (T_STOR_PAR)
+
+Каждая нода публикует параметры BS-таблиц в `F_HELLO_OK` (своя) и `F_DIR`
+(своя свежая), TLV `T_STOR_PAR = 0x0022`, 24 B:
+
+```
+u32 slots_lbs          # S_eff локальной таблицы (ячеек; авторазмер или пин)
+u32 slots_gbs          # ячеек федерационного среза
+u32 lam_est_day        # λ: записей/день (rolling-окно)
+u8  window_h           # окно оценки λ (24–72 ч)
+u8  bits_min           # текущий пол admission (контроллер; ≥ опер. пола)
+u16 tau_h              # score decay: −1 бит / τ (деф. 168 = неделя)
+u32 retention_est_h    # ожидаемое удержание при min-сложности:
+                       #   min(bits_min·τ, capacity/λ)
+u32 n_active           # HELLO-registered клиентов (self-reported)
+```
+
+Клиентское решение (запись хочет жить T_want): `bits = bits_min +
+⌈(T_want − retention_est_h)/τ⌉` при retention_est_h < T_want, иначе
+bits_min. Контроллер ноды (моно-политики): S_eff только вверх (анонимный
+«стог» не сжимается), bits_min только вверх; рост ×2 при давке ≥0.8 или
+переполнении, bits_min+1 — когда бюджет памяти исчерпан.
 
 ## 7. Secchan — шифрованный канал (нода↔нода, клиент↔нода)
 
@@ -217,6 +253,15 @@ wire-кадра** (`varint(total)` + payload) — канальная прозр�
 - `F_BEACON_SEED`: `T_ROUND` ∥ `T_SEED` ∥ список участвовавших `T_PK_DSA`.
 
 Все три типа передаются только через secchan (§7).
+
+**Синхронизация с реальным временем:** метка раунда N = `⌊unix_ts/10⌋`
+(границы строго на стен-часе, round_len обязан делить 3600 ⇒ BS-час =
+6·60 = 360 раундов, ячейки доски меняются ровно на отметке часа).
+Расписание раунда N: commit N в `[10N, 10N+3)`, reveal в `[10N+3, 10N+6)`,
+слэк до границы; **finalize на границе ровно `10(N+1)`** — seed с меткой
+N+1 публикуется в круглую отметку (данные раунда N → seed раунда N+1).
+«Время доступности нового сида» = круглые отметки k·10s; PoW-привязки
+верифицируются по окну (n−1, n, n+1).
 
 ## 9. Gossip (Global BS sync)
 

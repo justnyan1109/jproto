@@ -77,10 +77,19 @@ DEFAULTS = {
     "rate_limit": 5.0,          # msg/s/IP (протокол: 5)
     "secure_dial": True,        # нода↔нода: handshake secchan после TCP-dial
     "plain_ok": True,           # принимать plain-кадры от клиентов (dev-совместимо)
-    "max_local_cells": 256,
     "max_global_cells": 1024,
     "cell_size": 50,
     "bs_save_s": 60.0,
+
+    # --- BS-контроллер (wire.md §6a; протокол.md §9) ---------------------------
+    "tau_h": 168,               # score decay: −1 бит за τ («+1 бит ≈ +1 неделя»)
+    "bs_min_bits": 6,           # пол admission (не конкурируем дешёвым входом)
+    "bs_max_bits": 12,          # потолок битов (аппаратная граница майнинга)
+    "bs_window_h": 48,          # окно оценки λ (24–72 ч по протоколу)
+    "seff_start": 64,           # стартовый S_eff lbs (ячеек)
+    "bs_max_mb": 64.0,          # бюджет памяти → предел ячеек (моно-рост до него)
+    "bs_pin_cells": 0,          # >0 — оператор пинит размер lbs (авто off)
+    "rec_size_hint": 1200,      # байт/запись для перевода бюджета в ячейки
 }
 
 # Тарифицируемые типы кадров (rate limit applies; beacon/gossip/ping свободны).
@@ -195,9 +204,19 @@ class Node:
         self.counters = {"mix_in": 0, "mix_fwd": 0, "mix_online": 0,
                          "mix_store_local": 0, "mix_store_global": 0,
                          "pow_fail": 0, "rate_drop": 0, "bs_store": 0,
-                         "bs_read": 0, "beacon_seed_pub": 0, "gossip_push": 0}
+                         "bs_read": 0, "bs_evict": 0, "bs_full": 0,
+                         "bs_admitted": 0,
+                         "beacon_seed_pub": 0, "gossip_push": 0}
         self._buckets: dict[str, dict] = {}      # ip → {tokens, last}
         self._bucket_lock = threading.Lock()
+
+        # --- BS-контроллер (wire.md §6a): S_eff только ВВЕРХ (анонимность:
+        # не сжимаем «стог сена»), bits_min только ВВЕРХ (не продаём дешёвый
+        # вход) — оба с полами; оператор пинит bs_pin_cells → авто off.
+        self.seff = int(self.cfg["bs_pin_cells"]) or int(self.cfg["seff_start"])
+        self.bits_min = max(1, int(self.cfg["bs_min_bits"]))
+        self.lam_ph = 0.0            # λ, записей/час (lbs, rolling)
+        self._ctl_prev = (time.time(), 0)        # (ts, bs_admitted at prev tick)
 
         self.ex = ThreadPoolExecutor(max_workers=2, thread_name_prefix=f"{self.name}-pow")
         self.loop: asyncio.AbstractEventLoop | None = None
@@ -235,6 +254,8 @@ class Node:
                  addr=self.addr, http_port=self.cfg["http_port"])
         self._tasks = [
             asyncio.create_task(self._beacon_loop(), name="beacon"),
+            asyncio.create_task(self._phase_loop(), name="beacon-phase"),
+            asyncio.create_task(self._bsctl_loop(), name="bs-ctl"),
             asyncio.create_task(self._gossip_loop(), name="gossip"),
             asyncio.create_task(self._dialer_loop(), name="peers"),
             asyncio.create_task(self._bs_save_loop(), name="bs-save"),
@@ -423,12 +444,16 @@ class Node:
         else:
             sess.kind = "node"
         caps = W.get(fr.tvs, W.T_CAPS) or W.u32(0)
-        switch = [(W.T_POW_PAR, W.enc_pow_par(W.POW_TRANSPORT, self.cfg["transport_bits"], 2000)),
+        switch = [(W.T_POW_PAR, W.enc_pow_par(W.POW_TRANSPORT,
+                                              max(int(self.cfg["transport_bits"]), self.bits_min), 2000)),
                   (W.T_POW_PAR, W.enc_pow_par(W.POW_NODE, self.cfg["node_bits"], int(self.cfg["pow_budget_ms"]))),
                   (W.T_POW_PAR, W.enc_pow_par(W.POW_READ, self.cfg["read_bits"], 200))]
+        # TRANSPORT floor = admission floor (bits_min — поднимается контроллером;
+        # клиенту решать «+бит» только на удержание выше published retention).
         return reply(W.F_HELLO_OK, tvs=[(W.T_VER, W.u16(W.VERSION)),
                                         (W.T_CAPS, caps),
                                         (W.T_ADDR, self.addr),
+                                        (W.T_STOR_PAR, self._stor_par()),
                                         *switch])
 
     async def _h_seed_req(self, sess: Sess, fr: W.Frame) -> bytes | None:
@@ -453,7 +478,8 @@ class Node:
         for v in vals:
             ent = self.dir[[a for a, e in self.dir.items() if e["entry_val"] == v][0]]
             body += W.build_tlv_bytes(W.T_NODE_ENTRY, v) + W.build_tlv_bytes(W.T_SIG, ent["sig"])
-        return reply(W.F_DIR, tvs=[(W.T_DIR_DIGEST, digest), (W.T_NODE_LIST, body)])
+        return reply(W.F_DIR, tvs=[(W.T_DIR_DIGEST, digest), (W.T_NODE_LIST, body),
+                                   (W.T_STOR_PAR, self._stor_par())])
 
     async def _h_dir(self, sess: Sess, fr: W.Frame) -> None:
         self._absorb_dir(W.get(fr.tvs, W.T_NODE_LIST) or b"")
@@ -616,50 +642,142 @@ class Node:
                      bits=meta["pow_bits"])
             return
         if not self.cfg["skip_pow"]:
-            ok = self._pow_common(JP.pow_digest(rpl), meta["pow_nonce"],
+            # NODE-digest КАНОНИЧНО: H(pow.1, R с обнулённым pow_nonce) —
+            # nonce не может входить в собственный digest (wire.md §6).
+            ok = self._pow_common(R.pow_digest_rpl(rpl), meta["pow_nonce"],
                                   meta["pow_bits"], W.POW_NODE, self.cfg["node_bits"])
             if not ok:
                 self.counters["pow_fail"] += 1
                 log_json(self.name, "warn", "final_pow_fail")
                 return
         value = parsed["ky_ct"] + parsed["aead_nonce"] + parsed["msg_ct"]
-        cell = C.h_cell(value)
+        cell = R.cell_of(parsed)      # dest из заголовка R v2.1; 0^32 → h_cell(value)
         ts = time.time()
         if itype == W.I_STORE_GLOBAL:
             ok = self._bs_insert(self.global_bs, cell, value, int(meta["pow_bits"]), ts,
-                                 self.cfg["max_global_cells"], self.cfg["cell_size"])
+                                 self._cap_global(), self.cfg["cell_size"])
             self.counters["mix_store_global"] += 1
         else:
             ok = self._bs_insert(self.local_bs, cell, value, int(meta["pow_bits"]), ts,
-                                 self.cfg["max_local_cells"], self.cfg["cell_size"])
+                                 self._cap_local(), self.cfg["cell_size"])
             self.counters["mix_store_local"] += 1
         self.counters["bs_store"] += 1
         log_json(self.name, "info", "bs_store", itype=itype, cell=cell.hex()[:16],
                  bits=int(meta["pow_bits"]), ok=ok)
 
+    def _budget_cells(self) -> int:
+        """Операторский бюджет памяти → предел ячеек lbs."""
+        return max(int(self.cfg["seff_start"]),
+                   int(float(self.cfg["bs_max_mb"]) * 1e6 // max(1, self.cfg["rec_size_hint"])))
+
+    def _cap_local(self) -> int:
+        """S_eff lbs: пин оператора фиксирует, иначе авторазмер (моно-рост)."""
+        pin = int(self.cfg["bs_pin_cells"])
+        return pin if pin > 0 else self.seff
+
+    def _cap_global(self) -> int:
+        """gbs — федерационный срез: размер операторский (cfg), зажат бюджетом."""
+        return min(int(self.cfg["max_global_cells"]), self._budget_cells())
+
+    def _score(self, r: dict, now: float) -> float:
+        """Score записи: bits − age/τ. τ_h=168 → «+1 бит ≈ +1 неделя»."""
+        tau_s = float(self.cfg["tau_h"]) * 3600.0
+        return float(r["bits"]) - (now - r["ts"]) / tau_s
+
     def _bs_insert(self, bs: dict, cell: bytes, value: bytes, bits: int, ts: float,
                    max_cells: int, cell_size: int) -> bool:
+        local = bs is self.local_bs
+        if local and bits < self.bits_min:
+            # admission floor ноды (контроллер/пол): дешевле — отбой 402
+            return False
         lst = bs.get(cell)
+        now = time.time()
         if lst is None:
             if len(bs) >= max_cells:
-                log_json(self.name, "warn", "bs_cells_full", kind="local" if bs is self.local_bs else "global")
+                self.counters["bs_full"] += 1
+                log_json(self.name, "warn", "bs_cells_full",
+                         kind="local" if local else "global")
                 return False
             bs[cell] = [{"v": value, "bits": bits, "ts": ts}]
+            self.counters["bs_admitted"] += 1
             return True
         if len(lst) >= cell_size:
-            now = time.time()
+            self.counters["bs_evict"] += 1
             worst_i, worst_s = None, None
             for i, r in enumerate(lst):
-                sc = r["bits"] - (now - r["ts"]) // 3600
+                sc = self._score(r, now)
                 if worst_s is None or sc < worst_s:
                     worst_i, worst_s = i, sc
-            new_bits = bits - (now - ts) // 3600
+            new_bits = bits - (now - ts) / float(self.cfg["tau_h"]) * 3600.0
             if new_bits <= (worst_s or 0):
                 return False
             lst[worst_i] = {"v": value, "bits": bits, "ts": ts}
+            self.counters["bs_admitted"] += 1
             return True
         lst.append({"v": value, "bits": bits, "ts": ts})
+        self.counters["bs_admitted"] += 1
         return True
+
+    # --- BS-контроллер: авторазмер S_eff, пол bits_min, метрики §6a ------------
+
+    async def _bsctl_loop(self) -> None:
+        cadence = max(300.0, min(float(self.cfg["bs_window_h"]) * 3600.0 / 8.0,
+                                 3600.0))
+        while not self._stop_evt.is_set():
+            await asyncio.sleep(cadence)
+            try:
+                self._bs_ctl_tick()
+            except Exception as e:
+                log_json(self.name, "error", "bs_ctl", err=repr(e))
+
+    def _bs_ctl_tick(self) -> None:
+        now = time.time()
+        t0, c0 = self._ctl_prev
+        adm = self.counters["bs_admitted"]
+        dt = max(1.0, now - t0)
+        self.lam_ph = max(0.0, (adm - c0) / dt * 3600.0)    # записей/час, rolling
+        self._ctl_prev = (now, adm)
+
+        if self.cfg["bs_pin_cells"]:
+            log_json(self.name, "info", "bs_ctl_pin",
+                     seff=int(self.cfg["bs_pin_cells"]),
+                     bits_min=self.bits_min, lam_ph=round(self.lam_ph, 2))
+            return
+        full = self.counters["bs_full"]
+        self.counters["bs_full"] = 0
+        cap = self._budget_cells()
+        pressure = len(self.local_bs) / max(1, self.seff)
+        grew = False
+        # рост: полный (full>0) либо прогнозный (давка ≥0.8) — в потолок бюджета
+        if (full > 0 or pressure >= 0.8) and self.seff * 2 <= cap:
+            self.seff *= 2
+            grew = True
+        if full > 0 and self.seff * 2 > cap:
+            # ёмкости не хватает ДАЖЕ до бюджета → поднимаем цену входа
+            # (+1 бит ⇒ маржинальный спам ×2), не режем S_eff (анонимность)
+            self.bits_min = min(int(self.cfg["bs_max_bits"]), self.bits_min + 1)
+            log_json(self.name, "warn", "bs_bits_up", bits_min=self.bits_min)
+        log_json(self.name, "info", "bs_ctl",
+                 seff=self.seff, bits_min=self.bits_min, lam_ph=round(self.lam_ph, 2),
+                 pressure=round(pressure, 2), grew=grew, full=full)
+
+    def _retention_est_h(self) -> int:
+        """Консервативная оценка удержания при min-сложности:
+        T ≈ min(bits_min·τ, capacity/λ). λ<0.5/час → считаем score-ветку."""
+        t_score = self.bits_min * max(1, int(self.cfg["tau_h"]))
+        slots_total = (self._cap_local() + self._cap_global()) * int(self.cfg["cell_size"])
+        if self.lam_ph > 0.5:
+            t_load = slots_total / self.lam_ph
+            return int(min(t_score, t_load))
+        return int(t_score)
+
+    def _stor_par(self) -> bytes:
+        return W.enc_stor_par(self._cap_local(), self._cap_global(),
+                              int(self.lam_ph * 24.0),
+                              int(self.cfg["bs_window_h"]),
+                              self.bits_min, int(self.cfg["tau_h"]),
+                              self._retention_est_h(),
+                              sum(len(v) for v in self.online.values()))
 
     async def _h_bs_store(self, sess: Sess, fr: W.Frame) -> bytes | None:
         idx = W.get(fr.tvs, W.T_CELL_IDX)
@@ -678,13 +796,18 @@ class Node:
         # исключено; раунд — окно (n−1, n, n+1), как везде (_pow_common).
         my_pd = JP.pow_digest(idx + rec)
         if profile != W.POW_TRANSPORT or not self._pow_common(
-                my_pd, nonce, bits, W.POW_TRANSPORT, self.cfg["transport_bits"]):
+                my_pd, nonce, bits, W.POW_TRANSPORT,
+                max(int(self.cfg["transport_bits"]), self.bits_min)):
             self.counters["pow_fail"] += 1
             log_json(self.name, "warn", "bs_store_pow", cell=idx.hex()[:16])
             return reply(W.F_BS_READ_RESP, tvs=[(W.T_ERR, W.enc_err(401, "pow"))])
+        if not self.cfg["skip_pow"] and bits < self.bits_min:
+            # admission floor контроллера: дешевле — отбой 402 (wire.md §6a)
+            return reply(W.F_BS_READ_RESP,
+                         tvs=[(W.T_ERR, W.enc_err(402, "bits_min"))])
         ts = time.time()
         ok = self._bs_insert(self.local_bs, idx, rec[:len(rec) - 12], int(bits), ts,
-                             self.cfg["max_local_cells"], self.cfg["cell_size"])
+                             self._cap_local(), self.cfg["cell_size"])
         self.counters["bs_store"] += 1
         log_json(self.name, "info", "bs_store_direct", cell=idx.hex()[:16],
                  bits=int(bits), ok=ok)
@@ -723,6 +846,9 @@ class Node:
     # --- beacon v2 ------------------------------------------------------------------
 
     def round_of_ts(self, ts: float) -> int:
+        """Метка раунда = floor(unix_ts / round_len): границы строго по
+        стен-часу (epoch), произвольный round_len ДОЛЖЕН делить 3600 (10 s →
+        6·60 = 360 раундов/час — BS- часовые ячейки выравниваются на часы)."""
         return int(ts // self.cfg["round_len"])
 
     def _round_frac(self, n: int) -> float:
@@ -730,10 +856,14 @@ class Node:
         return (time.time() - n * rl) / rl
 
     def _prev_seed(self, n: int) -> bytes:
-        """seed(N−1): из цепочки либо genesis-константа (boot-раунд, согласованная
-        у всех boot-кандидатов — DESIGN_NOTES §beacon)."""
-        for c in (n - 1, n - 2):
-            s = self.seeds.get(c)
+        """chain-seed для state(n): СИД РАУНДА n, опубликованная ровно на его
+        границе (данные round n−1); до первой границы — genesis (короткая
+        согласованная константа boot-цепочки, DESIGN_NOTES §beacon)."""
+        s = self.seeds.get(n)
+        if s is not None:
+            return s
+        for k in (n - 1, n - 2):
+            s = self.seeds.get(k)
             if s is not None:
                 return s
         return C.GENESIS_SEED
@@ -764,14 +894,42 @@ class Node:
         return out
 
     async def _beacon_loop(self) -> None:
-        """hbdrand v2 (protocol.md §2): A commit [0,0.3R) → B reveal [0.3,0.6) →
-        C finalize t0+0.6R; окна — LOCAL wall-clock."""
+        """hbdrand v2 с привязкой к стен-часу. Границы раунда — wall-clock
+        (k·round_len от epoch). Расписание раунда N:
+            [0.0·R, 0.3)   commit(N)      (данные раунда N)
+            [0.3·R, 0.6)   reveal(N)
+            [0.6·R, 1.0)   слэк на поздние reveal
+            БЕЗОПАСНОСТЬ ГРАНИЦЫ (т.е. ровно (N+1)·R): finalize → появляется
+        seed(N+1). «Время, когда доступен новый сид» = круглые отметки k·R,
+        и seed(k) привязан к PoW раунда k (см. _pow_common окно ±1).
+        Синхронизация (фазы) несекретна — защищена подписями (wire.md §7)."""
+        rl = float(self.cfg["round_len"])
+        # boot: до первой границы seeds пуст — genesis-цепочка
+        cur = self.round_of_ts(time.time())
+        while not self._stop_evt.is_set():
+            now = time.time()
+            target = (self.round_of_ts(now) + 1) * rl
+            await asyncio.sleep(min(max(0.05, target - now + 0.002), rl))
+            if self._stop_evt.is_set():
+                break
+            nxt = self.round_of_ts(time.time())
+            if nxt == cur:
+                continue
+            await self._finalize(cur)          # данные round cur → seed(cur+1)
+            self._gc_rounds(nxt)
+            cur = nxt
+            st = self._round_state(cur)
+            if not st.commit_sent:
+                st.commit_sent = True
+                self._bcast_commit(st)
+
+    async def _phase_loop(self) -> None:
+        """Фазы внутри раунда (commit/reveal) — по frac относительно границы."""
         tick = max(0.01, min(0.05, self.cfg["round_len"] / 20.0))
         while not self._stop_evt.is_set():
             await asyncio.sleep(tick)
             try:
-                now = time.time()
-                n = self.round_of_ts(now)
+                n = self.round_of_ts(time.time())
                 frac = self._round_frac(n)
                 st = self._round_state(n)
                 if frac < self.cfg["commit_frac"]:
@@ -782,11 +940,8 @@ class Node:
                     if st.commit_sent and not st.reveal_sent:
                         st.reveal_sent = True
                         self._bcast_reveal(st)
-                elif not st.finalized:
-                    st.finalized = True
-                    await self._finalize(n)
             except Exception as e:
-                log_json(self.name, "error", "beacon_loop", err=repr(e))
+                log_json(self.name, "error", "beacon_phase", err=repr(e))
 
     def _bcast_commit(self, st: RoundState) -> None:
         sig = C.dsa_sign(self.sk_dsa, b"JPCOMMIT" + W.u64(st.n) + st.commit)
@@ -815,14 +970,17 @@ class Node:
                 asyncio.ensure_future(sc.send(frame))
 
     async def _finalize(self, n: int) -> None:
+        """Данные beacon-раунда n → seed метки n+1 (публикуется ровно на
+        границе (n+1)·R — «круглое время доступности нового сида»)."""
         st = self.round_states.get(n)
         prev = self._prev_seed(n)
         commits = self._valid_commits(st) if st else {}
+        label = n + 1
         if len(commits) < 2:
             # Emergency (protocol.md §2.2.4): <2 коммитов — seed не двигается
-            self.seeds[n] = prev
-            log_json(self.name, "warn", "beacon_emergency", rnd=n, commits=len(commits))
-            self._publish_seed(n, prev, [])
+            self.seeds[label] = prev
+            log_json(self.name, "warn", "beacon_emergency", rnd=label, commits=len(commits))
+            self._publish_seed(label, prev, [])
             return
         contrib = []
         for pk, (v, r, _sig) in (st and st.reveals.items() or []):
@@ -833,16 +991,16 @@ class Node:
                 continue  # не биндинг — уже отфильтровано in on_reveal_frame
             contrib.append((pk, v))
         if not contrib:
-            self.seeds[n] = prev
-            log_json(self.name, "warn", "beacon_emergency_noreveal", rnd=n)
-            self._publish_seed(n, prev, [])
+            self.seeds[label] = prev
+            log_json(self.name, "warn", "beacon_emergency_noreveal", rnd=label)
+            self._publish_seed(label, prev, [])
             return
         contrib.sort(key=lambda t: t[0])            # по pk ЛЕКСИКОГРАФИЧЕСКИ
         seed = C.h_beacon(prev + W.u64(n) + b"".join(v for _, v in contrib))
-        self.seeds[n] = seed
+        self.seeds[label] = seed
         self.counters["beacon_seed_pub"] += 1
-        log_json(self.name, "info", "beacon_seed", rnd=n, k=len(contrib))
-        self._publish_seed(n, seed, [pk for pk, _ in contrib])
+        log_json(self.name, "info", "beacon_seed", rnd=label, k=len(contrib))
+        self._publish_seed(label, seed, [pk for pk, _ in contrib])
 
     def _publish_seed(self, n: int, seed: bytes, pks: list[bytes]) -> None:
         tvs = [(W.T_ROUND, W.u64(n)), (W.T_SEED, seed)]
@@ -997,7 +1155,7 @@ class Node:
             if len(full) >= 32 + 1088 + 12:
                 value, bits, ts = full[:len(full) - 12], int.from_bytes(full[-12:-8], "little"), int.from_bytes(full[-8:], "little")
                 self._bs_insert(self.global_bs, cell, value, bits, float(ts),
-                                self.cfg["max_global_cells"], self.cfg["cell_size"])
+                                self._cap_global(), self.cfg["cell_size"])
             i += 2
 
     # --- dialer / dir -----------------------------------------------------------------
@@ -1191,6 +1349,11 @@ class Node:
             "global_cells": len(self.global_bs),
             "local_recs": sum(len(v) for v in self.local_bs.values()),
             "global_recs": sum(len(v) for v in self.global_bs.values()),
+            "seff": self._cap_local(),
+            "bits_min": self.bits_min,
+            "lam_ph": round(self.lam_ph, 3),
+            "retention_est_h": self._retention_est_h(),
+            "n_active": sum(len(v) for v in self.online.values()),
             "counters": dict(self.counters),
             "uptime_s": round(now - self.started_at, 1),
         }

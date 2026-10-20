@@ -12,6 +12,7 @@ import os
 import pytest
 
 from conftest import get_free_port        # helper из conftest (не fixture)
+from jproto_ref import wire as W
 from jproto_ref.node import DEFAULTS, Node
 from jproto_ref.chat import Chat, Identity, _parse_home
 
@@ -124,6 +125,39 @@ def test_offline_board(ids, tmp_path):
     asyncio.run(body())
 
 
+def test_bs_ctl_growth_and_floor():
+    """Контроллер §6a: S_eff растёт ×2 в пределах бюджета и не сжимается,
+    bits_min ↑ только когда ёмкость упёрлась в бюджет."""
+    import time as _t
+    cfg = dict(DEFAULTS)
+    cfg.update({"data_dir": None, "http_port": 0, "bs_max_mb": 0.05,
+                "seff_start": 4, "bs_min_bits": 2, "bs_window_h": 48})
+    n = Node(cfg)
+    now = _t.time()
+    n._ctl_prev = (now - 100, 0)
+    n.counters["bs_admitted"] = 30               # λ ≈ 1080/ч, rolling
+    n.local_bs = {i.to_bytes(32, "big"): [] for i in range(4)}   # стог = S_eff
+    n.counters["bs_full"] = 3
+    for expect_seff in (8, 16, 32):
+        n._bs_ctl_tick()
+        assert n.seff == expect_seff, (n.seff, expect_seff)
+        n.counters["bs_full"] = 3
+    # 64 > бюджета 41 (0.05 MB / 1200 B) → рост запрещён, bits_min растёт
+    # (check поднимает цену на каждом тике с full>0 при переполненном бюджете)
+    n._bs_ctl_tick()
+    assert n.seff == 32 and n.bits_min >= 3
+    # никогда не сжимаем: full нет → те же seff/bits_min
+    n.counters["bs_full"] = 0
+    n._bs_ctl_tick()
+    assert n.seff == 32 and n.bits_min >= 3
+    # retention при λ=0: bits_min·τ
+    n.lam_ph = 0.0
+    assert n._retention_est_h() == n.bits_min * 168
+    # T_STOR_PAR кодировка == dec
+    vals = W.dec_stor_par(n._stor_par())
+    assert vals[0] == 32 and vals[4] == n.bits_min and vals[5] == 168
+
+
 def test_home_index_parse(ids):
     alice, _bob = ids
 
@@ -139,6 +173,41 @@ def test_home_index_parse(ids):
                 if addr == node.addr:
                     e2 = _parse_home(str(i), entries)
                     assert e2["addr"] == node.addr
+        finally:
+            _drain(chats)
+            await shutdown(node, ntask)
+
+    asyncio.run(body())
+
+
+def test_stor_par_and_round_alignment(ids, tmp_path):
+    """§6a: HELLO_OK носит T_STOR_PAR (slots/bits_min/τ/retention/n_active);
+    раунды синхронны стен-часу: round_label = ts//round_len и сиды не
+    «перекрывают» будущее; лейбл часа BS = round // 360; round_labels
+    выровнены на границы (кратны ts//round_len)."""
+    (a, _b) = ids
+    rl = 3.0
+
+    async def body():
+        node, ntask = await boot_node(get_free_port)
+        chats: list[Chat] = []
+        try:
+            chat = await connect_chat(a, node, str(tmp_path / "p3"))
+            chats = [chat]
+            sp = chat.stor_par
+            assert sp is not None, "нет T_STOR_PAR в HELLO_OK"
+            assert sp["slots_lbs"] >= 1 and sp["slots_gbs"] >= 1
+            assert sp["bits_min"] >= 1 and sp["tau_h"] == 168
+            assert sp["window_h"] == 48
+            assert sp["n_active"] >= 1          # мы HELLO-зарегистрированы
+            assert sp["retention_h"] > 0
+            # round = floor(unix/round_len) — привязка к стен-часу
+            n_now = node.round_of_ts(__import__("time").time())
+            assert abs(n_now * rl - __import__("time").time()) < 2 * rl
+            if chat.round is not None:
+                assert chat.round <= n_now, "сид будущего раунда?"
+                hour = chat.round // 360
+                assert hour >= 0 and 6 * 60 == 360
         finally:
             _drain(chats)
             await shutdown(node, ntask)

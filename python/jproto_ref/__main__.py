@@ -29,6 +29,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--name", help="имя узла для логов (env JP_NAME)")
     p.add_argument("--data-dir", help="каталог состояния BS (env JP_DATA_DIR, деф. /tmp/jp-data)")
     p.add_argument("--pow-lib", help="путь к libjppow.so (env JPPOW_LIB, деф. build/libjppow.so)")
+    p.add_argument("--bs-max-mb", type=float, default=None, metavar="MB",
+                   help="бюджет памяти lbs (env JP_BS_MAX_MB, деф. 64)")
+    p.add_argument("--bs-cells", type=int, default=None, metavar="N",
+                   help="пин размера lbs (>0: авто-размер off) (env JP_BS_CELLS, деф. авто)")
+    p.add_argument("--bs-min-bits", type=int, default=None, metavar="BITS",
+                   help="пол admission bits_min (env JP_BS_MIN_BITS, деф. 6)")
     return p
 
 
@@ -98,6 +104,22 @@ def _cfg_from_cli() -> dict:
         os.environ["JPPOW_LIB"] = a.pow_lib
     elif (v := _env("JPPOW_LIB")) is not None:
         os.environ["JPPOW_LIB"] = v
+
+    if a.bs_max_mb is not None:
+        over["bs_max_mb"] = float(a.bs_max_mb)
+    elif (v := _env("JP_BS_MAX_MB")) not in (None, ""):
+        over["bs_max_mb"] = float(v)
+
+    if a.bs_cells is not None:
+        over["bs_pin_cells"] = int(a.bs_cells)
+    elif (v := _env("JP_BS_CELLS")) not in (None, ""):
+        over["bs_pin_cells"] = int(v)
+
+    if a.bs_min_bits is not None:
+        over["bs_min_bits"] = int(a.bs_min_bits)
+    elif (v := _env("JP_BS_MIN_BITS")) not in (None, ""):
+        over["bs_min_bits"] = int(v)
+
     return over
 
 

@@ -74,6 +74,9 @@ T_COMMIT           = 0x001B   # 32 B commit beacon-участника
 T_DIR_DIGEST       = 0x001C   # 32 B digest директории
 T_REC_DIGEST       = 0x001E   # 32 B H(rec) записи BS
 T_PAD              = 0x001F   # padding (CSPRNG)
+T_STOR_PAR         = 0x0022   # стат хранения (§6a): u32 slots_lbs ‖ u32 slots_gbs ‖
+                               #   u32 λ_est_day ‖ u8 window_h ‖ u8 bits_min ‖
+                               #   u16 τ_h ‖ u32 retention_est_h ‖ u32 n_active
 
 # --- PoW профили -------------------------------------------------------------
 POW_TRANSPORT      = 1
@@ -92,14 +95,17 @@ VERSION            = 1        # T_VER
 # recipient-payload R (wire.md §5 v2, == JP_RPL_LEN_FIXED):
 #   hdr(24): magic u16 'JP', ver u8=1, itype u8, session u32, seq u32,
 #            pow_nonce u64 LE, pow_bits u8, pow_prof u8, body_len u16
+#   dest:    32 B cell-индекс хранения (R v2.1; нода-получатель кладёт запись
+#            сюда; 0^32 = «cell от payload» — совместимость с v2.0)
 #   body:    kyber_ct(1088) ‖ aead_nonce(12) ‖ msg_ct(msg+tag16)
 #   далее:   CSPRNG padding до RPL_LEN_FIXED (в body_len не входит)
-RECIPIENT_HDR_LEN  = 24
+RECIPIENT_HDR_LEN_CORE = 24    # ядро заголовка (AD сообщение строится из него)
+RECIPIENT_HDR_LEN  = 56        # 24 core ‖ dest(32)
 RECIPIENT_MAGIC    = 0x4A50   # 'JP'
-MSG_PAYLOAD_MAX    = 5888     # plaintext сообщения (msg_ct = msg+tag ≤ 5904)
+MSG_PAYLOAD_MAX    = 5856     # msg_ct = msg+tag ≤ 5872 (−32 B от v2.0: dest)
 RPL_HDR_LEN        = RECIPIENT_HDR_LEN
 ADDR_LEN           = 32                    # адрес узла = h(pk_kem)
-RPL_LEN_FIXED      = 7028     # = 24 + 1088 + 12 + 5888 + 16
+RPL_LEN_FIXED      = 7028     # 56 + 1088 + 12 + 5856 + 16 (размер не менялся)
 KEM_CT_LEN         = 1088     # ML-KEM-768 ct (например внутри T_KYBER_CT)
 AEAD_NONCE_LEN     = 12
 AEAD_TAG_LEN       = 16
@@ -285,15 +291,20 @@ def dec_transport(v: bytes) -> tuple[str, int, bool]:
 
 def enc_recipient_header(itype: int, session: int, seq: int,
                          pow_nonce: int, pow_bits: int, pow_prof: int,
-                         body_len: int) -> bytes:
+                         body_len: int, dest: bytes | None = None) -> bytes:
     if not 1 <= itype <= 5 or body_len < KEM_CT_LEN + AEAD_NONCE_LEN:
         raise ValueError("itype 1..5 / body_len ≥ 1100 required")
+    d = dest if dest is not None else b"\x00" * 32
+    if len(d) != 32:
+        raise ValueError("dest cell 32 B")
     return struct.pack("<HBB", RECIPIENT_MAGIC, VERSION, itype) + \
-        struct.pack("<IIQBBH", session, seq, pow_nonce, pow_bits, pow_prof, body_len)
+        struct.pack("<IIQBBH", session, seq, pow_nonce, pow_bits, pow_prof, body_len) + d
 
 
 def recipient_header(value: bytes) -> dict:
-    """Разбор заголовка recipient-payload R (остаток peeled-слоя при ctl=0)."""
+    """Разбор заголовка recipient-payload R (остаток peeled-слоя при ctl=0).
+    vR2.1: 24 B core ‖ dest(32). dest = ячейка BS-ноды (0^32 → legacy).
+    AD сообщения = itype‖session‖seq (из core) — dest в AD не входит."""
     if len(value) < RECIPIENT_HDR_LEN:
         raise ValueError("recipient header truncated")
     magic, ver, itype = struct.unpack_from("<HBB", value, 0)
@@ -309,13 +320,14 @@ def recipient_header(value: bytes) -> dict:
         raise ValueError("recipient body_len too small")
     if len(value) < RECIPIENT_HDR_LEN + body_len:
         raise ValueError("recipient body truncated")
+    dest = bytes(value[24:56])
     return {"itype": itype, "session": session, "seq": seq,
             "pow_nonce": pow_nonce, "pow_bits": pow_bits, "pow_prof": pow_prof,
-            "body_len": body_len}
+            "body_len": body_len, "dest": dest}
 
 
 def recipient_clean(value: bytes) -> tuple[dict, bytes]:
-    """header + body без padding; возвращает (meta, header‖body)."""
+    """header (+dest) + body без padding; возвращает (meta, header‖body)."""
     meta = recipient_header(value)
     return meta, bytes(value[:RECIPIENT_HDR_LEN + meta["body_len"]])
 
@@ -342,6 +354,24 @@ def enc_pow_par(profile: int, bits: int, budget_hint: int, mode: int = 0) -> byt
 def dec_pow_par(v: bytes) -> tuple[int, int, int, int]:
     profile, bits, budget, mode = struct.unpack_from("<BBIB", v, 0)
     return profile, bits, budget, mode
+
+
+# --- T_STOR_PAR: опубликованная статистика хранения (wire.md §6a) -------------
+
+def enc_stor_par(slots_lbs: int, slots_gbs: int, lam_day: int, window_h: int,
+                 bits_min: int, tau_h: int, retention_h: int,
+                 n_active: int) -> bytes:
+    return struct.pack("<IIIBBHII", int(slots_lbs), int(slots_gbs),
+                       max(0, int(lam_day)), max(1, int(window_h) & 0xFF),
+                       max(0, int(bits_min) & 0xFF), max(1, int(tau_h) & 0xFFFF),
+                       max(0, int(retention_h)) & 0xFFFFFFFF,
+                       max(0, int(n_active)) & 0xFFFFFFFF)
+
+
+def dec_stor_par(v: bytes) -> tuple[int, int, int, int, int, int, int, int]:
+    if len(v) != 24:
+        raise ValueError("stor par size")
+    return struct.unpack("<IIIBBHII", v)
 
 
 def enc_err(code: int, msg: str = "") -> bytes:

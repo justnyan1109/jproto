@@ -10,6 +10,7 @@ int jp_msg_pack(int itype, uint32_t session, uint32_t seq,
                 uint64_t pow_nonce, uint8_t pow_bits, uint8_t pow_prof,
                 const uint8_t recip_pk[JP_KEM768_PK_LEN],
                 const uint8_t *msg, size_t msg_len,
+                const uint8_t dest_cell[JP_RPL_DEST_LEN],
                 uint8_t rpl_out[JP_RPL_LEN_FIXED]) {
     if (!msg || msg_len == 0 || msg_len > JP_MSG_PAYLOAD_MAX || !recip_pk || !rpl_out)
         return JP_ERR_FORMAT;
@@ -33,7 +34,13 @@ int jp_msg_pack(int itype, uint32_t session, uint32_t seq,
 
     return jp_recipient_payload_encode(rpl_out, itype, session, seq,
                                        pow_nonce, pow_bits, pow_prof,
-                                       ct, nonce, msgct, msg_len + JP_AEAD_TAG_LEN);
+                                       ct, nonce, msgct, msg_len + JP_AEAD_TAG_LEN,
+                                       dest_cell);
+}
+
+void jp_msg_pow_digest_node(const uint8_t rpl[JP_RPL_LEN_FIXED],
+                            uint8_t out[JP_H_LEN]) {
+    jp_payload_digest_node(rpl, out);
 }
 
 /* внутренний шаг: encaps до узла i и запаковка pt слоем i */

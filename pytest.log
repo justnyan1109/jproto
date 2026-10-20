@@ -1,0 +1,25 @@
+2026-10-20 05:31:30.108 DEBUG   asyncio selector_events.py:64: Using selector: EpollSelector
+2026-10-20 05:31:44.266 DEBUG   asyncio selector_events.py:64: Using selector: EpollSelector
+2026-10-20 05:31:46.389 ERROR   asyncio base_events.py:1891: Task exception was never retrieved
+future: <Task finished name='Task-25' coro=<Chat.read_loop() done, defined at /home/just/src/oc/junq-net/python/jproto_ref/chat.py:428> exception=RuntimeError('readexactly() called while another coroutine is already waiting for incoming data')>
+Traceback (most recent call last):
+  File "/home/just/src/oc/junq-net/python/jproto_ref/chat.py", line 431, in read_loop
+    fr = await self.sec.recv_frame()
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/just/src/oc/junq-net/python/jproto_ref/secchan.py", line 126, in recv_frame
+    fr = await read_frame(self.reader)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/just/src/oc/junq-net/python/jproto_ref/secchan.py", line 48, in read_frame
+    chunk = await reader.readexactly(1)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/asyncio/streams.py", line 786, in readexactly
+    await self._wait_for_data('readexactly')
+  File "/usr/lib/python3.14/asyncio/streams.py", line 542, in _wait_for_data
+    raise RuntimeError(
+        f'{func_name}() called while another coroutine is '
+        f'already waiting for incoming data')
+RuntimeError: readexactly() called while another coroutine is already waiting for incoming data
+2026-10-20 05:31:46.561 DEBUG   asyncio selector_events.py:64: Using selector: EpollSelector
+2026-10-20 05:31:48.571 DEBUG   asyncio selector_events.py:64: Using selector: EpollSelector
+2026-10-20 05:31:55.615 DEBUG   asyncio selector_events.py:64: Using selector: EpollSelector
+2026-10-20 05:31:55.618 DEBUG   asyncio selector_events.py:64: Using selector: EpollSelector

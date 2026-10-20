@@ -176,6 +176,7 @@ class Chat:
         self.sec: SC.SecChan | None = None
         self.node_addr: bytes | None = None
         self.pow_par: dict[int, tuple[int, int]] = {}   # profile → (bits, budget)
+        self.stor_par: dict | None = None               # T_STOR_PAR ноды (§6a)
         self.seeds: dict[int, bytes] = {}
         self.round: int | None = None
         self.nodes: dict[bytes, dict] = {}
@@ -219,6 +220,9 @@ class Chat:
         for v in W.get_all(ok.tvs, W.T_POW_PAR):
             prof, bits, budget, _mode = W.dec_pow_par(v)
             self.pow_par[prof] = (bits, budget)
+        v = W.get(ok.tvs, W.T_STOR_PAR)
+        if v:
+            self._take_stor_par(v)
 
         # dir (нужен для маршрута), потом seeds с ретраем (beacon финализируется
         # к t0+0.6R — свежую ноду подождём)
@@ -240,6 +244,17 @@ class Chat:
                                            C.h_dirlist(pairs[i][1])):
                 continue
             self.nodes[ent["addr"]] = ent
+        v = W.get(fr.tvs, W.T_STOR_PAR)     # свежая стат ноды (§6a)
+        if v:
+            self._take_stor_par(v)
+
+    def _take_stor_par(self, v: bytes) -> None:
+        try:
+            keys = ("slots_lbs", "slots_gbs", "lam_day", "window_h", "bits_min",
+                    "tau_h", "retention_h", "n_active")
+            self.stor_par = dict(zip(keys, W.dec_stor_par(v)))
+        except ValueError:
+            pass
 
     async def _refresh_seeds_retry(self, tries: int = 10, pause: float = 1.0) -> None:
         await self.sec.send(W.F_SEED_REQ)
@@ -269,13 +284,17 @@ class Chat:
             self._pow = JP.pow_ctx(seed_hour)
         return self._pow
 
-    def mine_cert(self, payload: bytes, profile: int) -> tuple[int, int]:
+    def mine_cert(self, payload: bytes, profile: int,
+                  bits_min: int | None = None) -> tuple[int, int]:
         """cert по payload (digest = pow_digest(payload)). Страховка от бага
         jppow_mine (out_bits может завышаться): фактические ведущие биты
         пересчитываем jppow_hash+лз уже на client-side — иначе нода (честно
-        пересчитывая digest) откажет cert. При сдохшем .so — zero-cert."""
+        пересчитывая digest) откажет cert. bits_min — форс требуемых бит
+        (удержание ≥ published retention). При сдохшем .so — zero-cert."""
         bits_req, budget = self.pow_par.get(
             profile, (6 if profile == W.POW_TRANSPORT else 4, 2000))
+        if bits_min is not None:
+            bits_req = max(bits_req, int(bits_min))
         if not self.pow_ok:
             self.out("!! JPPOW недоступен: шлю zero-cert (нода skip_pow?")
             return 0, 0
@@ -336,7 +355,19 @@ class Chat:
             return int(time.time() // 3600)
         return self.round // 360
 
-    async def post(self, text: str) -> int:
+    def retention_bits(self, keep_h: int | None = None) -> int:
+        """Сколько бит майнить под запись: bits_min ноды; если keep_h выше
+        published retention — +⌈(keep − retain)/τ⌉ («+1 бит ≈ +1 неделя»)."""
+        sp = self.stor_par or {}
+        bits_min = int(sp.get("bits_min") or 6)
+        if not keep_h:
+            return bits_min
+        tau = int(sp.get("tau_h") or 168)
+        ret = int(sp.get("retention_h") or 0)
+        over = max(0, int(keep_h) - ret)
+        return min(32, bits_min + -(-over // tau))
+
+    async def post(self, text: str, keep_h: int | None = None) -> int:
         pt = text.encode("utf-8")
         if not 1 <= len(pt) <= MSG_PAYLOAD_MAX:
             raise ValueError(f"длина msg 1..{MSG_PAYLOAD_MAX}")
@@ -347,7 +378,9 @@ class Chat:
         hour = self._hour()
         idx = board_cell(self.ident.addr, hour)
         rec = value + W.u32(0) + W.u64(0)          # хвост (score/ts) у ноды заново
-        nonce_p, bits = self.mine_cert(idx + rec, W.POW_TRANSPORT)
+        bits_keep = self.retention_bits(keep_h)
+        nonce_p, bits = self.mine_cert(idx + rec, W.POW_TRANSPORT,
+                                       bits_min=bits_keep)
         cert = W.enc_pow_cert(nonce_p, bits, W.POW_TRANSPORT)
         await self.sec.send(W.F_BS_STORE, 0, [
             (W.T_CELL_IDX, idx), (W.T_CELL_REC, rec), (W.T_POW, cert)])
@@ -457,9 +490,10 @@ def _parse_home(spec: str, entries: list[dict]) -> dict | None:
 
 
 class ChatApp:
-    def __init__(self, chat: Chat, out=print):
+    def __init__(self, chat: Chat, out=print, keep_h: int | None = None):
         self.c = chat
         self.out = out
+        self.keep_h = keep_h          # --keep ЧАСЫ (деф.: min-сложность ноды)
         self.peer: tuple[bytes, dict | None] | None = None
         self.running = True
 
@@ -490,6 +524,12 @@ class ChatApp:
         elif c == "/me":
             self.out(f"  addr  {self.c.ident.addr.hex()}")
             self.out(f"  node  {self.c.pin_key} secured, round={self.c.round}")
+            sp = self.c.stor_par
+            if sp:
+                self.out(f"  stor  seff={sp['slots_lbs']} gbs={sp['slots_gbs']} "
+                         f"bits_min={sp['bits_min']} τ={sp['tau_h']}ч "
+                         f"retain≈{sp['retention_h']}ч λ={sp['lam_day']}/д "
+                         f"n_active={sp['n_active']}")
         elif c == "/nodes":
             for i, (a, e) in enumerate(self._entries(), 1):
                 mark = "*" if e["addr"] == self.c.node_addr else " "
@@ -510,8 +550,10 @@ class ChatApp:
             if not rest:
                 raise ValueError("post: пустой текст")
             t0 = time.time()
-            hour = await self.c.post(rest)
-            self.out(f"  ✓ post → доска часа {hour} (PoW {time.time() - t0:.2f}s)")
+            hour = await self.c.post(rest, keep_h=self.keep_h)
+            bits = self.c.retention_bits(self.keep_h)
+            self.out(f"  ✓ post → доска часа {hour}, bits={bits} "
+                     f"(удержание ≈{self.keep_h or 'min'} ч, PoW {time.time() - t0:.2f}s)")
         elif c == "/fetch":
             for line_ in await self.c.fetch(int(rest or 0)):
                 self.out(f"  📌 {line_}")
@@ -569,7 +611,8 @@ def _cli() -> int:
     pr.add_argument("--node", required=True, metavar="HOST:PORT")
     pr.add_argument("--me", required=True, metavar="IDFILE")
     pr.add_argument("--pin-dir", default=None, help="каталог pin-файла (default ~/.jproto)")
-
+    pr.add_argument("--keep", type=int, default=None, metavar="HOURS",
+                    help="удержание /post (часы); деф. — min-сложность ноды")
     po = sub.add_parser("oneshot", help="скриптовый: послать и/или ждать")
     po.add_argument("--node", required=True, metavar="HOST:PORT")
     po.add_argument("--me", required=True, metavar="IDFILE")
@@ -579,6 +622,8 @@ def _cli() -> int:
     po.add_argument("--reply")   # автоответ на пришедшее (e2e)
     po.add_argument("--expect")  # ждать сообщение с подстрокой → exit 0
     po.add_argument("--wait", type=float, default=20.0)
+    po.add_argument("--keep", type=int, default=None, metavar="HOURS",
+                    help="удержание /post (часы); деф. — min-сложность ноды")
     po.add_argument("--pin-dir", default=None)
 
     a = p.parse_args()
@@ -603,7 +648,7 @@ def _cli() -> int:
             print(f"подключение: {e!r}", file=sys.stderr)
             return 1
         if a.cmd == "run":
-            await ChatApp(chat).run()
+            await ChatApp(chat, keep_h=a.keep).run()
             return 0
 
         # oneshot: sender-режим (--msg TO) и/или wait-режим (--expect/--reply)

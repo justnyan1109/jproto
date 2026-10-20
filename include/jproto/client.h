@@ -19,12 +19,20 @@ typedef struct {
 /* === упаковка msg → recipient-payload R (без слоёв) ===
  * АЕАД-шифрует msg ключом из ML-KEM encaps к pk адресата.
  * pow_* — поля PoW-сертификата (nonce подбирается клиентом майнером):
- * дайджест = H(pow.1, R с этим nonce), проверяет BS-hop. */
+ * для NODE-профиля дайджест каноничный — H(pow.1, R с обнулённым nonce)
+ * (jp_msg_pow_digest_node); проверяет BS-hop.
+ * dest_cell (32 B, NULL → 0^32): cell-индекс BS-ноды (R v2.1); 0^32 →
+ * cell = h_cell(value) legacy. */
 int jp_msg_pack(int itype, uint32_t session, uint32_t seq,
                 uint64_t pow_nonce, uint8_t pow_bits, uint8_t pow_prof,
                 const uint8_t recip_pk[JP_KEM768_PK_LEN],
                 const uint8_t *msg, size_t msg_len,
+                const uint8_t dest_cell[JP_RPL_DEST_LEN],
                 uint8_t rpl_out[JP_RPL_LEN_FIXED]);
+
+/* NODE-digest R для майнинга (zero-nonce нормализация, onion.h) */
+void jp_msg_pow_digest_node(const uint8_t rpl[JP_RPL_LEN_FIXED],
+                            uint8_t out[JP_H_LEN]);
 
 /* === сборка полного onion-пакета ===
  * route[0..L-1] — от entry (n1) к выходному узлу (nL); R уже упакован.
