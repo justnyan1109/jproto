@@ -1,138 +1,188 @@
-"""Recipient-payload (wire.md §5): общий формат клиента и ноды.
+"""Recipient-payload (R) + onion build/peel — wire.md §5 v2, байт-в-байт с src/onion.c.
 
-PT последнего слоя onion (о финале сигнализирует magic 'JP' в начале PT — см.
-DESIGN_NOTES §onion: поля addr_next==0 в финальном слое нет, чтобы выиграть
-ёмкость для app-payload):
+R (фикс 7028 B):
+    hdr 24 B: magic 'JP' u16 ‖ ver u8=1 ‖ itype u8 ‖ session u32 ‖ seq u32 ‖
+              pow_nonce u64 LE ‖ pow_bits u8 ‖ pow_prof u8 ‖ body_len u16
+    body:     ky_ct(1088) ‖ aead_nonce(12) ‖ msg_ct(msg+tag16)
+    tail:     CSPRNG padding до 7028 (в body_len не входит)
+msg_ct = AEAD(ss_msg, nonce12, aad = itype‖session‖seq (9 B), pt = msg);
+ss_msg = ML-KEM-768 Encaps(pk_recipient), свежий на каждое сообщение.
 
-    header 50 B: magic 'JP' u16 ‖ ver u8 ‖ itype u8 ‖ dest(32) ‖ session u32 ‖
-                 seq u32 ‖ reply_to u32 ‖ body_len u16
-    body (body_len):
-        store-типы (I_STORE_LOCAL/I_STORE_GLOBAL/I_OFFER/I_REPLY):
-            cell_idx(32) ‖ ky_ct(1088) ‖ nonce12 ‖ msg_ct
-        I_ONLINE:            ky_ct(1088) ‖ nonce12 ‖ msg_ct
-    + CSPRNG padding до целевого размера PT (PT_TARGET).
-
-msg_ct = AEAD(ss_msg, nonce12, aad = sess(4LE)‖seq(4LE)‖reply_to(4LE), pt=app_bytes)
-ss_msg = ML-KEM Encaps(pk_recipient), FRESH на каждое сообщение.
-dest/التsession/seq/reply_to читает финальная нода (маршрутизация ONLINE и
-логирование); НЕКОТОРЫЕ поля тела — только получатель (msg AAD = header-поля).
-
-Ёмкости: MNEM TARGET ниже подобраны так, чтобы blob-размеры слоёв уложились
-в u16, а OFFER/REPLY TLV-набор (~220 B) влез в app- plaintext (DESIGN_NOTES).
+Onion (v2): packet = kem_ct_i(1088) ‖ blob_i;
+    blob_i = nonce12 ‖ AEAD(ss_i, AD = ONION_AD, PT_i);
+    PT_i   = next_addr(32) ‖ u16 ctl ‖ [ct_{i+1}(1088) при ctl=1088] ‖ blob_{i+1};
+    финальный слой: addr = 0^32, ctl = 0, remainder = R (ровно 7028 B).
+Длины детерминированы: blob(d) = 7090 + (d−1)*1150; packet(3) = 10478,
+packet(4) = 11628.
 """
 
 from __future__ import annotations
 
 import os
+import struct
 
+from . import crypto as C
 from . import wire as W
-from .crypto import (AEAD_NONCE_LEN, KEM_CT_LEN, aead_decrypt, aead_encrypt,
-                     h_cell, h_mix, kem_decaps, kem_encaps, DEV_SEED_HOUR)
 
-# Целевые размеры PT (AEAD plaintext) последнего слоя.
-PT_TARGET = {
-    W.I_ONLINE: 1400,
-    W.I_STORE_LOCAL: 1800,
-    W.I_STORE_GLOBAL: 1800,
-    W.I_OFFER: 1800,
-    W.I_REPLY: 1800,
-}
+RPL_LEN_FIXED   = W.RPL_LEN_FIXED          # 7028
+RPL_HDR_LEN     = W.RECIPIENT_HDR_LEN      # 24
+MSG_PAYLOAD_MAX = W.MSG_PAYLOAD_MAX        # 5888
+BLOB_BASE       = W.BLOB_BASE              # 7090
+LAYER_ADD       = W.ONION_LAYER_ADD        # 1150
+ONION_AD        = W.ONION_AD               # b"jproto.onion.1"
 
-PT_L_MAX = 1252   # ceiling по upstream фиксированному blob 1280 — справочно
-MSG_CT_MAX = max(PT_TARGET.values()) - W.RECIPIENT_HDR_LEN - KEM_CT_LEN - AEAD_NONCE_LEN
+KEM_CT = C.KEM_CT_LEN
+NONCE_LEN = C.AEAD_NONCE_LEN
+TAG_LEN = C.AEAD_TAG_LEN
 
 
-def pt_target(itype: int) -> int:
-    return PT_TARGET.get(itype, max(PT_TARGET.values()))
+def msg_aad(itype: int, session: int, seq: int) -> bytes:
+    """9 B: itype u8 ‖ session u32 LE ‖ seq u32 LE."""
+    return struct.pack("<BII", itype, session, seq)
 
 
-def cell_index(seed_hour: bytes, pk_recipient: bytes, salt: bytes, session: int) -> bytes:
-    """cell_index = H(h.1, seed_hour ‖ pk_B ‖ salt ‖ sess) (protocol.md §7).
-
-    Первое сообщение пары: salt = 0^64, sess = 0 (protocol.md §7 wins; README
-    предлагает omit — DESIGN_NOTES: конкатенация НУЛЕВЫХ полей).
-    """
-    assert len(seed_hour) == 32 and len(pk_recipient) == 1184 and len(salt) == 64
-    return h_cell(bytes(seed_hour) + bytes(pk_recipient) + bytes(salt) + W.u32(session))
+def blob_len(depth_remaining: int) -> int:
+    """|blob| для depth слоёв ниже (depth=1 — финальный слой)."""
+    if not 1 <= depth_remaining <= 4:
+        raise ValueError("depth 1..4")
+    return BLOB_BASE + (depth_remaining - 1) * LAYER_ADD
 
 
-def msg_aad(session: int, seq: int, reply_to: int) -> bytes:
-    return W.u32(session) + W.u32(seq) + W.u32(reply_to)
+def packet_len(total_layers: int) -> int:
+    """|packet| = kem_ct(1088) ‖ blob(L)."""
+    return KEM_CT + blob_len(total_layers)
 
 
-def first_salt() -> bytes:
-    """salt первого контакта (protocol.md §7): нулевой 64 B."""
-    return bytes(64)
+def onion_layer_count(itype: int) -> int:
+    """I_ONLINE → 3; store/offere/reply (BL-записи) → 4."""
+    return 3 if itype == W.I_ONLINE else 4
 
 
-def encaps_msg(pk: bytes, app_pt: bytes, session: int, seq: int, reply_to: int) -> tuple[bytes, bytes, bytes]:
-    """(ky_ct, nonce12, msg_ct): fresh ML-KEM encaps + AEAD."""
-    ss, kyct = kem_encaps(pk)
-    nonce = os.urandom(AEAD_NONCE_LEN)
-    ct = aead_encrypt(ss, nonce, msg_aad(session, seq, reply_to), app_pt)
-    return kyct, nonce, ct
+def wrap_layer(pt: bytes, pk: bytes) -> tuple[bytes, bytes]:
+    """Encaps(pk) → (ct, blob = nonce12 ‖ AEAD(PT)). Возвращает (kem_ct, blob)."""
+    ss, ct = C.kem_encaps(pk)
+    nonce = os.urandom(NONCE_LEN)
+    blob = nonce + C.aead_encrypt(ss, nonce, ONION_AD, bytes(pt))
+    return ct, blob
 
 
-def decaps_msg(sk_seed: bytes, kyct: bytes, nonce: bytes, msg_ct: bytes,
-               session: int, seq: int, reply_to: int) -> bytes:
-    ss = kem_decaps(sk_seed, kyct)
-    return aead_decrypt(ss, nonce, msg_aad(session, seq, reply_to), msg_ct)
+def peel(kem_sk_seed: bytes, packet: bytes) -> dict:
+    """Peel одного слоя. Возвращает dict:
+       final=True  → "rpl": R (7028 B), "next": None
+       final=False → "next": ct_next ‖ blob_next, "next_addr": addr32
+    Ошибка ключа/тэга/размеров → ValueError."""
+    pkt = bytes(packet)
+    if len(pkt) < KEM_CT + BLOB_BASE:
+        raise ValueError(f"packet too short {len(pkt)}")
+    ss = C.kem_decaps(kem_sk_seed, pkt[:KEM_CT])
+    blob = pkt[KEM_CT:]
+    try:
+        pt = C.aead_decrypt(ss, blob[:NONCE_LEN], ONION_AD, blob[NONCE_LEN:])
+    except Exception as e:
+        raise ValueError("bad aead tag") from e
+    addr = pt[:W.ADDR_LEN]
+    ctl = pt[W.ADDR_LEN] | (pt[W.ADDR_LEN + 1] << 8)
+    if ctl == 0:
+        rpl = pt[W.ADDR_LEN + 2:]
+        if len(rpl) != RPL_LEN_FIXED:
+            raise ValueError(f"final R len {len(rpl)} != {RPL_LEN_FIXED}")
+        return {"final": True, "rpl": rpl, "next": None, "next_addr": None}
+    if ctl != KEM_CT:
+        raise ValueError(f"bad ctl {ctl}")
+    ct_next = pt[W.ADDR_LEN + 2: W.ADDR_LEN + 2 + KEM_CT]
+    blob_next = pt[W.ADDR_LEN + 2 + KEM_CT:]
+    if len(ct_next) != KEM_CT or len(blob_next) < blob_len(1):
+        raise ValueError("bad next layer sizes")
+    return {"final": False, "next": ct_next + blob_next, "next_addr": addr, "rpl": None}
 
 
-def build_recipient(itype: int, dest: bytes, session: int, seq: int,
-                    reply_to: int, body: bytes, pt_total: int = 0, rng=None) -> bytes:
-    """Полный recipient-payload = header + body + CSPRNG padding до pt_total."""
-    target = pt_total or pt_target(itype)
-    hdr = W.enc_recipient_header(itype, dest, session, seq, reply_to, len(body))
-    data = hdr + body
-    if len(data) > target:
-        raise ValueError(f"recipient payload too big: {len(data)} > {target}")
-    rng = rng or os.urandom
-    return data + rng(target - len(data))
+def build_onion(rpl: bytes, route: list[tuple[bytes, bytes]]) -> bytes:
+    """R → полный packet по маршруту [(addr32, kem_pk1184), …] от n1 к nL."""
+    rpl = bytes(rpl)
+    if len(rpl) != RPL_LEN_FIXED:
+        raise ValueError(f"rpl len {len(rpl)} != {RPL_LEN_FIXED}")
+    if not 1 <= len(route) <= 4:
+        raise ValueError("route 1..4 хопов")
+    blob = None
+    ct = None
+    for i in range(len(route) - 1, -1, -1):
+        addr, pk = route[i]
+        pt = bytearray()
+        if i == len(route) - 1:
+            pt += bytes(32)
+            pt += struct.pack("<H", 0)
+            pt += rpl
+        else:
+            pt += route[i + 1][0]          # addr узла i+1 (читает его узел i)
+            pt += struct.pack("<H", KEM_CT)
+            pt += ct
+            pt += blob
+        ct, blob = wrap_layer(bytes(pt), pk)
+    return ct + blob
 
 
-def parse_recipient(rec: bytes) -> dict:
-    """header + body (+padding игнорируется); вернёт itype/dest/session/seq/reply_to/body."""
-    meta = W.recipient_header(rec)
-    body = rec[W.RECIPIENT_HDR_LEN:W.RECIPIENT_HDR_LEN + meta["body_len"]]
-    if len(body) != meta["body_len"]:
-        raise ValueError("recipient body short")
-    meta["body"] = body
-    return meta
+# --- R: encode / parse ----------------------------------------------------------
+
+def encode(itype: int, session: int, seq: int, pow_nonce: int,
+           pow_bits: int, pow_prof: int, pk_recip: bytes, msg: bytes) -> bytes:
+    """msg → полный R (7028 B): encaps + AEAD + CSPRNG-паддинг."""
+    msg = bytes(msg)
+    if not 1 <= len(msg) <= MSG_PAYLOAD_MAX:
+        raise ValueError(f"msg len {len(msg)} не в 1..{MSG_PAYLOAD_MAX}")
+    ss, ky = C.kem_encaps(pk_recip)
+    nonce = os.urandom(NONCE_LEN)
+    msg_ct = C.aead_encrypt(ss, nonce, msg_aad(itype, session, seq), msg)
+    return assemble(itype, session, seq, pow_nonce, pow_bits, pow_prof,
+                    ky, nonce, msg_ct)
 
 
-def store_body(kyct: bytes, nonce: bytes, msg_ct: bytes, cell_idx: bytes) -> bytes:
-    """body store-типа: cell_idx(32) ‖ ky ‖ nonce ‖ ct (DESIGN_NOTES)."""
-    assert len(cell_idx) == 32
-    return cell_idx + kyct + nonce + msg_ct
+def assemble(itype: int, session: int, seq: int, pow_nonce: int,
+             pow_bits: int, pow_prof: int, ky_ct: bytes, aead_nonce: bytes,
+             msg_ct: bytes) -> bytes:
+    """Из готовых компонентов → R (заполнение CSPRNG до 7028)."""
+    body = bytes(ky_ct) + bytes(aead_nonce) + bytes(msg_ct)
+    if len(body) != KEM_CT + NONCE_LEN + len(msg_ct):
+        raise ValueError("body components mismatch")
+    if not TAG_LEN <= len(msg_ct) <= MSG_PAYLOAD_MAX + TAG_LEN:
+        raise ValueError("msg_ct out of range")
+    hdr = W.enc_recipient_header(itype, session, seq, pow_nonce, pow_bits,
+                                 pow_prof, len(body))
+    pad = len(hdr) + len(body)
+    if pad > RPL_LEN_FIXED:
+        raise ValueError("R overflow")
+    out = hdr + body + os.urandom(RPL_LEN_FIXED - pad)
+    assert len(out) == RPL_LEN_FIXED
+    return out
 
 
-def online_body(kyct: bytes, nonce: bytes, msg_ct: bytes) -> bytes:
-    return kyct + nonce + msg_ct
+def parse(r: bytes) -> dict:
+    """R → meta + body-слайсы (copy=False: bytes → bytes(value))."""
+    r = bytes(r)
+    if len(r) != RPL_LEN_FIXED:
+        raise ValueError(f"R len {len(r)} != {RPL_LEN_FIXED}")
+    meta = W.recipient_header(r)
+    body_off = RPL_HDR_LEN
+    body = r[body_off: body_off + meta["body_len"]]
+    return {**meta,
+            "ky_ct": body[:KEM_CT],
+            "aead_nonce": body[KEM_CT: KEM_CT + NONCE_LEN],
+            "msg_ct": body[KEM_CT + NONCE_LEN:],
+            "rpl": r}
 
 
-def parse_store_body(b: bytes) -> tuple[bytes, bytes, bytes, bytes]:
-    """→ (cell_idx, kyct, nonce12, msg_ct)."""
-    cell, rest = b[:32], b[32:]
-    if len(rest) < KEM_CT_LEN + AEAD_NONCE_LEN:
-        raise ValueError("store body short")
-    return cell, rest[:KEM_CT_LEN], rest[KEM_CT_LEN:KEM_CT_LEN + AEAD_NONCE_LEN], rest[KEM_CT_LEN + AEAD_NONCE_LEN:]
+def value_of(rpl_dict: dict) -> bytes:
+    """value BS-записи (и gossip-дайджеста): ky ‖ nonce ‖ msg_ct."""
+    return rpl_dict["ky_ct"] + rpl_dict["aead_nonce"] + rpl_dict["msg_ct"]
 
 
-# --- маршрут / route_digest (protocol.md §5) ---------------------------------
-
-def route_digest(route_addrs: list[bytes], round_num: int) -> bytes:
-    """route_digest = H(mix.1, r1.addr ‖ … ‖ rL.addr ‖ u64(round))."""
-    assert route_addrs, "route пуст"
-    return h_mix(b"".join(bytes(a) for a in route_addrs) + W.u64(round_num))
+def cell_of(rpl_dict: dict) -> bytes:
+    """Ячейка BS: h_cell(value) — выводится нодой без расшифровки msg (dev)."""
+    return C.h_cell(value_of(rpl_dict))
 
 
-def hour_seed(seeds: dict[int, bytes], round_num: int, blocks: int = 360,
-              fallback: bytes | None = None) -> bytes:
-    """seed_hour = seed(round − round mod blocks); если не вычислен — fallback
-    (dev-константа; привязка PoW к раунду живёт в seed_round во входе)."""
-    anchor = round_num - (round_num % blocks)
-    s = seeds.get(anchor)
-    if s is not None:
-        return s
-    return fallback if fallback is not None else DEV_SEED_HOUR
+def decaps_msg(kem_sk_seed: bytes, parsed: dict, itype: int,
+               session: int, seq: int) -> bytes:
+    """Вскрывает принятое сообщение: Decaps(sk_B) + AEAD open msg."""
+    ss = C.kem_decaps(kem_sk_seed, parsed["ky_ct"])
+    return C.aead_decrypt(ss, parsed["aead_nonce"],
+                          msg_aad(itype, session, seq), parsed["msg_ct"])

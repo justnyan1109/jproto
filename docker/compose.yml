@@ -14,9 +14,10 @@ services:
       - jp-data-a:/data
     environment:
       JP_NAME: fedA
+      JP_PUBLISH_HOST: fedA
       JP_PORT: "9100"
       JP_HTTP_PORT: "9200"
-      JP_POW_LIB: /app/build/libjppow.so
+      JPPOW_LIB: /app/build/libjppow.so
       JP_PEERS: "fedB:9100,fedC:9100"
     ports:
       - "9101:9100"
@@ -31,9 +32,10 @@ services:
       - jp-data-b:/data
     environment:
       JP_NAME: fedB
+      JP_PUBLISH_HOST: fedB
       JP_PORT: "9100"
       JP_HTTP_PORT: "9200"
-      JP_POW_LIB: /app/build/libjppow.so
+      JPPOW_LIB: /app/build/libjppow.so
       JP_PEERS: "fedA:9100,fedC:9100"
     ports:
       - "9102:9100"
@@ -48,9 +50,10 @@ services:
       - jp-data-c:/data
     environment:
       JP_NAME: fedC
+      JP_PUBLISH_HOST: fedC
       JP_PORT: "9100"
       JP_HTTP_PORT: "9200"
-      JP_POW_LIB: /app/build/libjppow.so
+      JPPOW_LIB: /app/build/libjppow.so
       JP_PEERS: "fedA:9100,fedB:9100"
     ports:
       - "9103:9100"

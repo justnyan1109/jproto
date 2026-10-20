@@ -37,6 +37,9 @@ F_GOSSIP_FETCH     = 0x0071
 F_GOSSIP_DATA      = 0x0072
 F_PING             = 0x0080
 F_PONG             = 0x0081
+F_SCH_HELLO        = 0x0090   # secchan handshake: T_PK_KEM, T_PK_DSA, T_SIG ("JPCS1")
+F_SCH_HELLO_OK     = 0x0091   # secchan handshake: T_KYBER_CT, T_PK_DSA, T_SIG ("JPCS2")
+F_SCH_SEALED       = 0x0092   # насыпанный кадр: T_SEQ(u64), T_MSG_CT
 
 FLAG_NEEDS_ACK     = 0x0001
 
@@ -61,7 +64,7 @@ T_AEAD_NONC        = 0x0011   # 12 B nonce AEAD
 T_MSG_CT           = 0x0012   # AEAD ct сообщения
 T_SALT             = 0x0013   # 64 B salt (handshake)
 T_SESSION          = 0x0014   # u32 session number
-T_SEQ              = 0x0015   # u32 seq внутри сессии
+T_SEQ              = 0x0015   # u64 LE (secchan seq); в msg-TLV допускается u32
 T_NODE_LIST        = 0x0016   # N × T_NODE_ENTRY (конкатенация вложенных TLV)
 T_NODE_ENTRY       = 0x0017   # T_ADDR ‖ T_PK_KEM ‖ T_PK_DSA ‖ T_TRANSPORT
 T_ROUTE            = 0x0018   # 3 адреса маршрута по 32 B (исп. также как список addr)
@@ -86,13 +89,27 @@ I_REPLY            = 5
 
 # --- константы формата -------------------------------------------------------
 VERSION            = 1        # T_VER
-INNER_PACKET_SIZE  = 1280     # wire.md §5 (см. DESIGN_NOTES — Evaluation: BLOB ПОСЛЕДНЕГО
-                              #  СЛОЯ ПЕРЕМЕННЫЙ; 1280 было бы PT=1252 → app-payload ≤ 100 B)
-RECIPIENT_HDR_LEN  = 50       # magic(2) ver(1) itype(1) dest(32) session(4) seq(4) reply_to(4) body_len(2)
+# recipient-payload R (wire.md §5 v2, == JP_RPL_LEN_FIXED):
+#   hdr(24): magic u16 'JP', ver u8=1, itype u8, session u32, seq u32,
+#            pow_nonce u64 LE, pow_bits u8, pow_prof u8, body_len u16
+#   body:    kyber_ct(1088) ‖ aead_nonce(12) ‖ msg_ct(msg+tag16)
+#   далее:   CSPRNG padding до RPL_LEN_FIXED (в body_len не входит)
+RECIPIENT_HDR_LEN  = 24
 RECIPIENT_MAGIC    = 0x4A50   # 'JP'
-MAX_MSG_PAYLOAD    = 8192     # из protocol.md §12 (в onion не помещается целиком — DESIGN_NOTES)
+MSG_PAYLOAD_MAX    = 5888     # plaintext сообщения (msg_ct = msg+tag ≤ 5904)
+RPL_HDR_LEN        = RECIPIENT_HDR_LEN
+ADDR_LEN           = 32                    # адрес узла = h(pk_kem)
+RPL_LEN_FIXED      = 7028     # = 24 + 1088 + 12 + 5888 + 16
 KEM_CT_LEN         = 1088     # ML-KEM-768 ct (например внутри T_KYBER_CT)
 AEAD_NONCE_LEN     = 12
+AEAD_TAG_LEN       = 16
+# onion v2: packet = kem_ct(1088) ‖ blob; blob = nonce12 ‖ AEAD(PT, AD=ONION_AD)
+PT_FINAL_LEN       = 34 + RPL_LEN_FIXED          # addr32 ‖ u16(0) ‖ R
+BLOB_BASE          = AEAD_NONCE_LEN + AEAD_TAG_LEN + PT_FINAL_LEN   # 7090
+ONION_LAYER_ADD    = 1122 + AEAD_NONCE_LEN + AEAD_TAG_LEN           # 1150
+ONION_AD           = b"jproto.onion.1"           # AD всех слоёв (14 B)
+MAX_ONION_LAYERS   = 8
+MAX_FRAME_TOTAL    = 65536    # varint total лимит кадра TCP
 
 CAPS_MIX           = 1 << 0
 CAPS_BS            = 1 << 1
@@ -257,27 +274,26 @@ def dec_transport(v: bytes) -> tuple[str, int, bool]:
     return host, port, bool(tls)
 
 
-# --- recipient-payload helpers (wire.md §5, внутренний plaintext слоя L) ------
-# header 50 B: magic u16 'JP' ‖ ver u8 ‖ itype u8 ‖ dest(32) ‖ session u32 ‖
-#              seq u32 ‖ reply_to u32 ‖ body_len u16
-# body: store-типы (I_STORE_LOCAL/I_STORE_GLOBAL/I_OFFER/I_REPLY):
-#           cell_idx(32) ‖ kyber_ct(1088) ‖ nonce(12) ‖ msg_ct     [DESIGN_NOTES]
-#       I_ONLINE:          kyber_ct(1088) ‖ nonce(12) ‖ msg_ct
-# далее CSPRNG padding до целевого размера PT (см. jproto_ref.recipient).
-# dest нужен финальной ноде для адресации ONLINE-доставки (клиент зарегистрирован
-# T_ADDR в HELLO); session/seq/reply_to идут открыто — клиент берёт их для AAD;
-# integrity обеспечивает AEAD. Поле dest — пробел спеки (DESIGN_NOTES §recipient).
+# --- recipient-payload helpers (wire.md §5 v2) --------------------------------
+# header 24 B: magic u16 'JP' ‖ ver u8 ‖ itype u8 ‖ session u32 ‖ seq u32 ‖
+#              pow_nonce u64 LE ‖ pow_bits u8 ‖ pow_prof u8 ‖ body_len u16
+# body: kyber_ct(1088) ‖ aead_nonce(12) ‖ msg_ct(msg+tag16)
+# далее CSPRNG padding до RPL_LEN_FIXED. dest/reply_to в заголовке НЕТ:
+# reply_to живёт внутри msg-plaintext (TLV), адресация ONLINE — всем
+# зарегистрированным клиентам ноды (DESIGN_NOTES). session/seq/pow_* идут
+# открыто; целостность даёт AEAD msg (AD = itype‖session‖seq) и сцепка слоёв.
 
-def enc_recipient_header(itype: int, dest: bytes, session: int, seq: int,
-                         reply_to: int, body_len: int) -> bytes:
-    if not 1 <= itype <= 5 or len(dest) != 32:
-        raise ValueError("itype 1..5 / dest 32B required")
-    return struct.pack("<HBB", RECIPIENT_MAGIC, VERSION, itype) + bytes(dest) + \
-        struct.pack("<IIIH", session, seq, reply_to, body_len)
+def enc_recipient_header(itype: int, session: int, seq: int,
+                         pow_nonce: int, pow_bits: int, pow_prof: int,
+                         body_len: int) -> bytes:
+    if not 1 <= itype <= 5 or body_len < KEM_CT_LEN + AEAD_NONCE_LEN:
+        raise ValueError("itype 1..5 / body_len ≥ 1100 required")
+    return struct.pack("<HBB", RECIPIENT_MAGIC, VERSION, itype) + \
+        struct.pack("<IIQBBH", session, seq, pow_nonce, pow_bits, pow_prof, body_len)
 
 
 def recipient_header(value: bytes) -> dict:
-    """Разбор заголовка recipient-payload (PT последнего слоя)."""
+    """Разбор заголовка recipient-payload R (остаток peeled-слоя при ctl=0)."""
     if len(value) < RECIPIENT_HDR_LEN:
         raise ValueError("recipient header truncated")
     magic, ver, itype = struct.unpack_from("<HBB", value, 0)
@@ -287,12 +303,15 @@ def recipient_header(value: bytes) -> dict:
         raise ValueError("bad version")
     if not 1 <= itype <= 5:
         raise ValueError("bad itype")
-    dest = value[4:36]
-    session, seq, reply_to, body_len = struct.unpack_from("<IIIH", value, 36)
+    session, seq, pow_nonce, pow_bits, pow_prof, body_len = \
+        struct.unpack_from("<IIQBBH", value, 4)
     if body_len < KEM_CT_LEN + AEAD_NONCE_LEN:
         raise ValueError("recipient body_len too small")
-    return {"itype": itype, "dest": dest, "session": session, "seq": seq,
-            "reply_to": reply_to, "body_len": body_len}
+    if len(value) < RECIPIENT_HDR_LEN + body_len:
+        raise ValueError("recipient body truncated")
+    return {"itype": itype, "session": session, "seq": seq,
+            "pow_nonce": pow_nonce, "pow_bits": pow_bits, "pow_prof": pow_prof,
+            "body_len": body_len}
 
 
 def recipient_clean(value: bytes) -> tuple[dict, bytes]:
@@ -359,10 +378,11 @@ def selftest() -> None:
     cert = enc_pow_cert(2**40 + 5, 6, POW_TRANSPORT)
     assert dec_pow_cert(cert) == (2**40 + 5, 6, POW_TRANSPORT)
 
-    hdr = enc_recipient_header(I_OFFER, b"\x11" * 32, 11, 22, 33, 1100)
-    meta = recipient_header(hdr)
+    hdr = enc_recipient_header(I_OFFER, 11, 22, 0x4444, 6, POW_NODE, 1100)
+    meta = recipient_header(hdr + b"\x00" * 1100)
     assert meta["itype"] == I_OFFER and meta["session"] == 11 and meta["seq"] == 22
-    assert meta["reply_to"] == 33 and meta["body_len"] == 1100 and meta["dest"] == b"\x11" * 32
+    assert meta["pow_nonce"] == 0x4444 and meta["pow_bits"] == 6
+    assert meta["pow_prof"] == POW_NODE and meta["body_len"] == 1100
 
     _e = enc_err(7, "boom")
     assert dec_err(_e) == (7, "boom")

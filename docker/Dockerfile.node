@@ -12,4 +12,5 @@ RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.
 ENV JPPOW_LIB=/app/pow/libjppow.so JP_DATA_DIR=/data
 
 ENTRYPOINT ["python", "-m", "jproto_ref"]
-CMD ["--help"]
+# конфиг целиком через JP_* env из compose (пустой CMD обязателен)
+CMD []

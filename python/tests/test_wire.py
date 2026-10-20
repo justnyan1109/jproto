@@ -6,7 +6,7 @@ import pytest
 
 from jproto_ref import wire as W
 from jproto_ref import recipient as R
-from jproto_ref.crypto import KEM_CT_LEN, AEAD_NONCE_LEN
+from jproto_ref import crypto as C
 
 
 def test_varint_roundtrip():
@@ -57,54 +57,71 @@ def test_scalars_transport_pow_err():
     assert W.dec_err(W.enc_err(3, "nopow")) == (3, "nopow")
 
 
-def test_recipient_payload_roundtrip_online():
-    pk, _sk = __import__("jproto_ref.crypto", fromlist=["kem_generate"]).kem_generate()
-    dest = os.urandom(32)
-    kyct, nonce, msg_ct = R.encaps_msg(pk, b"hello-B", session=1, seq=1, reply_to=0)
-    body = R.online_body(kyct, nonce, msg_ct)
-    rec = R.build_recipient(W.I_ONLINE, dest, 1, 1, 0, body)
-    assert len(rec) == R.PT_TARGET[W.I_ONLINE]     # padding до целевого PT
-    meta = R.parse_recipient(rec)
-    assert meta["itype"] == W.I_ONLINE and meta["session"] == 1 and meta["seq"] == 1
-    assert meta["dest"] == dest and meta["reply_to"] == 0
-    assert len(meta["body"]) == len(body)
-    # header-поля совпадают с AAD
-    assert W.recipient_header(rec[:W.RECIPIENT_HDR_LEN])["body_len"] == len(body)
+# --- v2 (wire.md §5) -------------------------------------------------------------
+
+def test_onion_v2_lengths():
+    assert R.RPL_LEN_FIXED == 7028
+    assert R.blob_len(1) == 7090
+    assert R.blob_len(2) == 7090 + 1150
+    assert R.packet_len(3) == 10478
+    assert R.packet_len(4) == 11628
+    assert R.onion_layer_count(W.I_ONLINE) == 3
+    assert R.onion_layer_count(W.I_STORE_GLOBAL) == 4
+    assert R.msg_aad(2, 0x11223344, 7) == bytes([2]) + W.u32(0x11223344) + W.u32(7)
 
 
-def test_recipient_payload_store_body_and_aad():
-    pk, sk = __import__("jproto_ref.crypto", fromlist=["kem_generate"]).kem_generate()
-    dest = os.urandom(32)
-    cell = R.cell_index(os.urandom(32), pk, bytes(64), 0)
-    kyct, nonce, msg_ct = R.encaps_msg(pk, b"pl", session=0, seq=1, reply_to=0)
-    body = R.store_body(kyct, nonce, msg_ct, cell)
-    assert body[:32] == cell
-    c2, k2, n2, m2 = R.parse_store_body(body)
-    assert (c2, k2, n2, m2) == (cell, kyct, nonce, msg_ct)
-    parse = R.parse_recipient(R.build_recipient(W.I_STORE_LOCAL, dest, 0, 1, 0, body))
-    assert parse["itype"] == W.I_STORE_LOCAL and parse["session"] == 0
+def test_recipient_v2_roundtrip():
+    pk, sk = C.kem_generate()
+    msg = os.urandom(1337)
+    rpl = R.encode(W.I_STORE_GLOBAL, 0x11223344, 7, 0x99, 6, W.POW_NODE, pk, msg)
+    assert len(rpl) == R.RPL_LEN_FIXED
+    p = R.parse(rpl)
+    assert p["itype"] == W.I_STORE_GLOBAL and p["session"] == 0x11223344
+    assert p["seq"] == 7 and p["pow_nonce"] == 0x99 and p["pow_bits"] == 6
+    assert p["pow_prof"] == W.POW_NODE
+    assert R.decaps_msg(sk, p, W.I_STORE_GLOBAL, 0x11223344, 7) == msg
+    # value/cell выводимы нодой без расшифровки; паддинг CSPRNG на cell не влияет
+    assert len(R.value_of(p)) == 1088 + 12 + 1337 + 16
+    p2 = R.parse(R.assemble(W.I_STORE_GLOBAL, 0x11223344, 7, 0x99, 6, W.POW_NODE,
+                            p["ky_ct"], p["aead_nonce"], p["msg_ct"]))
+    assert R.cell_of(p2) == R.cell_of(p)
 
-    aad = R.msg_aad(0, 1, 0)
-    assert aad == W.u32(0) + W.u32(1) + W.u32(0)
-    pt = R.decaps_msg(sk, kyct, nonce, msg_ct, 0, 1, 0)
-    assert pt == b"pl"
+
+def test_onion_build_peel_chain():
+    keys = [C.kem_generate() for _ in range(4)]  # n1..n3 + получатель B
+    route = [(os.urandom(32), keys[i][0]) for i in range(3)]
+    msg = b"onion-v2-roundtrip"
+    rpl = R.encode(W.I_ONLINE, 7, 3, 5, 4, W.POW_NODE, keys[3][0], msg)
+    pkt = R.build_onion(rpl, route)
+    assert len(pkt) == R.packet_len(3)
+    d1 = R.peel(keys[0][1], pkt)
+    assert not d1["final"] and d1["next_addr"] == route[1][0]
+    assert len(d1["next"]) == R.packet_len(2)
+    d2 = R.peel(keys[1][1], d1["next"])
+    assert not d2["final"] and d2["next_addr"] == route[2][0]
+    assert len(d2["next"]) == R.packet_len(1)
+    d3 = R.peel(keys[2][1], d2["next"])
+    assert d3["final"] and d3["rpl"] == rpl and d3["next"] is None
+    m = R.parse(d3["rpl"])
+    assert R.decaps_msg(keys[3][1], m, W.I_ONLINE, 7, 3) == msg
+    # tamper → reject; чужой sk → reject
+    bad = bytearray(pkt)
+    bad[1200] ^= 1
     with pytest.raises(ValueError):
-        R.decaps_msg(sk, kyct, nonce, msg_ct, 0, 1, 7)  # чужой reply_to в AAD
+        R.peel(keys[0][1], bytes(bad))
+    with pytest.raises(ValueError):
+        R.peel(keys[3][1], pkt)
 
 
 def test_recipient_capacity_fits_offer_tlvs():
-    """OFFER-набор TLV обязан влезать в app-plaintext (DESIGN_NOTES §onion)."""
+    """OFFER-набор TLV обязан влезать в msg-plaintext (v2)."""
     body_app = (W.build_tlv_bytes(W.T_SALT, bytes(64)) + W.build_tlv_bytes(W.T_SESSION, W.u32(1))
                 + W.build_tlv_bytes(W.T_ADDR, bytes(32))
                 + W.build_tlv_bytes(W.T_ROUTE, bytes(32) * 3))
-    assert len(body_app) <= R.MSG_CT_MAX, len(body_app)
-    pk, _sk = __import__("jproto_ref.crypto", fromlist=["kem_generate"]).kem_generate()
-    kyct, nonce, msg_ct = R.encaps_msg(pk, body_app, 0, 1, 0)
-    body = R.store_body(kyct, nonce, msg_ct, os.urandom(32))
-    rec = R.build_recipient(W.I_OFFER, os.urandom(32), 0, 1, 0, body)
-    assert len(rec) == R.PT_TARGET[W.I_OFFER]
-    blob = len(rec) + 16 + 12           # blob последнего слоя
-    assert blob + 16 < 65536            # и у укладки слоёв u16 не переполнится
+    assert len(body_app) <= R.MSG_PAYLOAD_MAX
+    pk, _sk = C.kem_generate()
+    rec = R.encode(W.I_OFFER, 0, 1, 0, 6, W.POW_NODE, pk, body_app)
+    assert len(rec) == R.RPL_LEN_FIXED
 
 
 def test_wire_selftest():

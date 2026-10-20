@@ -1,0 +1,10 @@
+python/.venv
+python/tests/__pycache__
+python/jproto_ref/__pycache__
+python/.pytest_cache
+venv/
+vendor/
+build/
+.git
+docs/
+python/pytest.log

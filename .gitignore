@@ -1,2 +1,6 @@
 build/
+python/**/__pycache__
+python/.pytest_cache
+python/.venv
+python/pytest.log
 vendor/RandomX/
