@@ -46,6 +46,24 @@ from . import recipient as R
 from . import secchan as SC
 from . import wire as W
 
+# Генсис сети: 2026-10-20 00:00 UTC. Внутренние метки раундов — абсолютные
+# (⌊unix/round_len⌋, границы сходятся нод-к-нодe); в status/F-SEED наружу
+# метка показывается СДВИНУТОЙ на GENESIS_RND — «сколько раундов работает
+# сеть» (см. round_display).
+GENESIS_TS  = W.GENESIS_TS
+GENESIS_RND = W.GENESIS_RND
+
+
+def round_display(n: int, cfg: dict) -> int:
+    """Наружная метка раунда (status/F_SEED): счётчик реальных раундов от
+    генсиса сети (N=0 на GENESIS_TS при round_len=10); unixtime создания
+    метки — «когда раунд был создан»."""
+    rl = float(cfg.get("round_len") or 10.0)
+    if rl != 10.0:
+        return n                          # не протокольный round_len — тесты
+    return n - W.GENESIS_RND
+
+
 # --- defaults конфига (переопределяются в cfg; tests/set особо) ---------------
 
 DEFAULTS = {
@@ -59,6 +77,7 @@ DEFAULTS = {
     "peers": [],                # [(host, port), ...] bootstrap-контакты
 
     "round_len": 10.0,          # s; протокол = 10
+    "round0_ts": GENESIS_TS,    # уunix-время генезиса сети (сдвиг метки в status)
     "commit_frac": 0.3,         # доля раунда на окно commit
     "reveal_frac": 0.6,         # t0+6s при 10s
     "hour_blocks": 360,         # раундов в часе (10 s → 360)
@@ -181,8 +200,7 @@ class Node:
             self.cfg.update(cfg)
         self.name = self.cfg["name"] or f"jp-node:{self.cfg['port']}"
 
-        self.pk_kem, self.sk_kem = C.kem_generate()
-        self.pk_dsa, self.sk_dsa = C.dsa_generate()
+        self.pk_kem, self.sk_kem, self.pk_dsa, self.sk_dsa = self._node_identity()
         self.addr = C.h_dir(self.pk_kem)
 
         self.dir_own = self._self_entry()
@@ -197,6 +215,7 @@ class Node:
 
         self.seeds: dict[int, bytes] = {}
         self.round_states: dict[int, RoundState] = {}
+        self.emergency: set[int] = set()    # метки, где сид = emergency (не квора)
 
         self.local_bs: dict[bytes, list[dict]] = {}
         self.global_bs: dict[bytes, list[dict]] = {}
@@ -206,7 +225,8 @@ class Node:
                          "pow_fail": 0, "rate_drop": 0, "bs_store": 0,
                          "bs_read": 0, "bs_evict": 0, "bs_full": 0,
                          "bs_admitted": 0,
-                         "beacon_seed_pub": 0, "gossip_push": 0}
+                         "beacon_seed_pub": 0, "beacon_emerg_pub": 0,
+                         "gossip_push": 0}
         self._buckets: dict[str, dict] = {}      # ip → {tokens, last}
         self._bucket_lock = threading.Lock()
 
@@ -456,14 +476,13 @@ class Node:
                                         (W.T_STOR_PAR, self._stor_par()),
                                         *switch])
 
-    async def _h_seed_req(self, sess: Sess, fr: W.Frame) -> bytes | None:
-        best = max(self.seeds) if self.seeds else None
-        if best is None:
+    async def _h_seed_req(self, sess: Sess, fr: Frame) -> bytes | None:
+        if not self.seeds:
             return reply(W.F_SEED, tvs=[(W.T_ERR, W.enc_err(503, "no seed yet"))])
-        prev_seed = self.seeds.get(best - 1)
-        tvs = [(W.T_ROUND, W.u64(best)), (W.T_SEED, self.seeds[best])]
-        if prev_seed:
-            tvs += [(W.T_ROUND, W.u64(best - 1)), (W.T_SEED, prev_seed)]
+        # последние 8 меток: рестарт-нода лечит восстановление цепочки
+        tvs = []
+        for n in sorted(self.seeds)[-8:]:
+            tvs += [(W.T_ROUND, W.u64(n)), (W.T_SEED, self.seeds[n])]
         return reply(W.F_SEED, tvs=tvs)
 
     async def _h_dir_req(self, sess: Sess, fr: W.Frame) -> bytes | None:
@@ -527,10 +546,16 @@ class Node:
             log_json(self.name, "warn", "pow_unavailable", err=str(e))
             return False
         n = self.round_of_ts(time.time())
+        tried = []
         for c in (n - 1, n, n + 1):
             seed = self.seeds.get(c)
-            if seed is not None and JP.verify(ctx, seed, pd, nonce, bits, required):
+            if seed is None:
+                tried.append((c, None))
+                continue
+            tried.append((c, seed.hex()[:8]))
+            if JP.verify(ctx, seed, pd, nonce, bits, required):
                 return True
+        log_json(self.name, "debug", "pow_window", wnd=tried, pd=pd.hex()[:12])
         return False
 
     async def _h_mix(self, sess: Sess, fr: W.Frame) -> bytes | None:
@@ -846,9 +871,11 @@ class Node:
     # --- beacon v2 ------------------------------------------------------------------
 
     def round_of_ts(self, ts: float) -> int:
-        """Метка раунда = floor(unix_ts / round_len): границы строго по
-        стен-часу (epoch), произвольный round_len ДОЛЖЕН делить 3600 (10 s →
-        6·60 = 360 раундов/час — BS- часовые ячейки выравниваются на часы)."""
+        """АБСОЛЮТНАЯ метка раунда = floor(unix_ts / round_len): границы строго
+        по стен-часу, произвольный round_len ДОЛЖЕН делить 3600 (10 s →
+        6·60 = 360 раундов/час — BS-часовые ячейки выравниваются на часы).
+        Наружу (status/F_SEED) метка показывается сдвинутой на генсис
+        (round_display),"""
         return int(ts // self.cfg["round_len"])
 
     def _round_frac(self, n: int) -> float:
@@ -917,6 +944,11 @@ class Node:
                 continue
             await self._finalize(cur)          # данные round cur → seed(cur+1)
             self._gc_rounds(nxt)
+            if len(self.seeds) > 2048:          # компакт-хвост цепочки
+                drop = sorted(self.seeds)[:-1024]
+                for k in drop:
+                    self.seeds.pop(k, None)
+                self.emergency = {n_ for n_ in self.emergency if n_ not in drop}
             cur = nxt
             st = self._round_state(cur)
             if not st.commit_sent:
@@ -977,10 +1009,12 @@ class Node:
         commits = self._valid_commits(st) if st else {}
         label = n + 1
         if len(commits) < 2:
-            # Emergency (protocol.md §2.2.4): <2 коммитов — seed не двигается
+            # Emergency (protocol.md §2.2.4): <2 коммитов — seed не двигается.
+            # Метка помечается emergency: чужой квора-сид её ПЕРЕЗАПИШЕТ
+            # (boot-расхождение цепочек самолечится, см. _absorb_seed).
             self.seeds[label] = prev
             log_json(self.name, "warn", "beacon_emergency", rnd=label, commits=len(commits))
-            self._publish_seed(label, prev, [])
+            self._publish_seed(label, prev, [], emergency=True)
             return
         contrib = []
         for pk, (v, r, _sig) in (st and st.reveals.items() or []):
@@ -993,19 +1027,53 @@ class Node:
         if not contrib:
             self.seeds[label] = prev
             log_json(self.name, "warn", "beacon_emergency_noreveal", rnd=label)
-            self._publish_seed(label, prev, [])
+            self._publish_seed(label, prev, [], emergency=True)
             return
         contrib.sort(key=lambda t: t[0])            # по pk ЛЕКСИКОГРАФИЧЕСКИ
         seed = C.h_beacon(prev + W.u64(n) + b"".join(v for _, v in contrib))
         self.seeds[label] = seed
+        self.emergency.discard(label)
         self.counters["beacon_seed_pub"] += 1
         log_json(self.name, "info", "beacon_seed", rnd=label, k=len(contrib))
         self._publish_seed(label, seed, [pk for pk, _ in contrib])
 
-    def _publish_seed(self, n: int, seed: bytes, pks: list[bytes]) -> None:
+    def _publish_seed(self, n: int, seed: bytes, pks: list[bytes],
+                      emergency: bool = False) -> None:
+        if emergency:
+            self.emergency.add(n)
+            self.counters["beacon_emerg_pub"] += 1
+        else:
+            self.emergency.discard(n)
         tvs = [(W.T_ROUND, W.u64(n)), (W.T_SEED, seed)]
         tvs += [(W.T_PK_DSA, pk) for pk in pks]
         self._bcast_nodes(W.build_frame(W.F_BEACON_SEED, 0, tvs))
+
+    def _absorb_seed(self, n: int, seed: bytes, quorum: int, src: str) -> None:
+        """Единое правило принятия сида (консистентность сети §8):
+        - метка пуста → принять (catch-up/первый);
+        - совпадает → ничего;
+        - расходится: у метки emergency-статус ИЛИ сид квора (≥2 участников)
+          → чужой ЗАМЕЩАЕТ локальный (boot-divergence самолечится);
+        - иначе (две честные цепочки?) — первый-писатель выигрывает, только лог."""
+        if len(seed) != 32:
+            return
+        old = self.seeds.get(n)
+        if old is None:
+            self.seeds[n] = seed
+            if quorum >= 2:
+                self.emergency.discard(n)
+            log_json(self.name, "info", "seed_update", rnd=n, src=src)
+            return
+        if old == seed:
+            return
+        if quorum >= 2 or n in self.emergency:
+            self.emergency.discard(n)
+            self.seeds[n] = seed
+            log_json(self.name, "warn", "seed_supersede", rnd=n, src=src,
+                     had=old.hex()[:16], now=seed.hex()[:16])
+        else:
+            log_json(self.name, "error", "seed_mismatch", rnd=n,
+                     have=old.hex()[:16], got=seed.hex()[:16])
 
     def on_commit_frame(self, n: int, cval: bytes, sig: bytes, pk: bytes) -> None:
         st = self.round_states.get(n)
@@ -1062,14 +1130,17 @@ class Node:
         seed = W.get(fr.tvs, W.T_SEED)
         if n is None or not seed or len(seed) != 32:
             return
-        old = self.seeds.get(n)
-        if old is not None and old != seed:
-            log_json(self.name, "error", "seed_mismatch", rnd=n,
-                     have=old.hex()[:16], got=seed.hex()[:16])
-            return
-        if old is None:
-            self.seeds[n] = seed
-            log_json(self.name, "info", "seed_update", rnd=n, src="net")
+        quorum = sum(1 for t, _ in fr.tvs if t == W.T_PK_DSA)
+        self._absorb_seed(n, seed, quorum, src=f"net:{sess.ip}")
+
+    async def _h_seed_absorb(self, sess: Sess, fr: W.Frame) -> None:
+        """Ответ F_SEED на нод-запрос (catch-up при peer_up): пара меток+сидов."""
+        tvs = fr.tvs
+        for i in range(0, len(tvs) - 1, 2):
+            if tvs[i][0] == W.T_ROUND and tvs[i + 1][0] == W.T_SEED:
+                n = W.as_u64(tvs[i][1])
+                if n is not None:
+                    self._absorb_seed(n, tvs[i + 1][1], 2, src=f"sync:{sess.ip}")
 
     # --- gossip (Global BS) ------------------------------------------------------------
 
@@ -1171,7 +1242,9 @@ class Node:
                     try:
                         await self._dial_peer(host, port)
                     except Exception as e:
-                        log_json(self.name, "warn", "dial_fail", to=key, err=repr(e))
+                        import traceback
+                        log_json(self.name, "warn", "dial_fail", to=key,
+                                 err=repr(e), tb=traceback.format_exc()[-600:])
             await asyncio.sleep(1.0)
 
     def _stopping(self) -> bool:
@@ -1194,6 +1267,12 @@ class Node:
         dfx = self._dir_frame()
         if dfx:
             await fs.send(dfx)
+        # catch-up цепочки сидов (без неё рестарт-нода публикует
+        # emergency-сид, расходящийся с живой цепочкой → seed_mismatch)
+        if fs.sec is not None:
+            await fs.sec.send(W.F_SEED_REQ, 0, [])
+        else:
+            await fs.send(W.build_frame(W.F_SEED_REQ, 0, []))
         asyncio.create_task(self._conn_reader(fs))
         log_json(self.name, "info", "peer_up", to=f"{host}:{port}",
                  secured=fs.sec is not None)
@@ -1226,6 +1305,42 @@ class Node:
         d = self.cfg["data_dir"]
         return os.path.join(d, "bs_snapshot.json") if d else None
 
+    def _node_identity(self) -> tuple[bytes, bytes, bytes, bytes]:
+        """Постоянное self-удостоверение ноды (data_dir/node_id.json): pk ноды
+        входит в TOFU-pin клиентов — рестарт с новым ключом тут же «сломает»
+        pin всем клиентам (mismatch → отказ тестами). Без data_dir —
+        эфемерные ключи (тесты)."""
+        p = None
+        d = self.cfg["data_dir"]
+        if d:
+            os.makedirs(d, exist_ok=True)
+            p = os.path.join(d, "node_id.json")
+        if p and os.path.exists(p):
+            try:
+                with open(p) as f:
+                    d0 = json.load(f)
+                pk_k, sk_k = bytes.fromhex(d0["pk_kem"]), bytes.fromhex(d0["sk_kem"])
+                pk_d, sk_d = bytes.fromhex(d0["pk_dsa"]), bytes.fromhex(d0["sk_dsa"])
+                if C.kem_pk_from_sk_seed(sk_k) == pk_k and \
+                        C.dsa_pk_from_sk_seed(sk_d) == pk_d:
+                    log_json(self.name, "info", "node_id_restored",
+                             addr=C.h_dir(pk_k).hex()[:16])
+                    return pk_k, sk_k, pk_d, sk_d
+                log_json(self.name, "warn", "node_id_bad", path=p)
+            except Exception as e:
+                log_json(self.name, "warn", "node_id_load_fail", err=repr(e))
+        pk_k, sk_k = C.kem_generate()
+        pk_d, sk_d = C.dsa_generate()
+        if p:
+            tmp = p + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"pk_kem": pk_k.hex(), "sk_kem": sk_k.hex(),
+                           "pk_dsa": pk_d.hex(), "sk_dsa": sk_d.hex(),
+                           "addr": C.h_dir(pk_k).hex()}, f)
+            os.replace(tmp, p)
+            os.chmod(p, 0o600)
+        return pk_k, sk_k, pk_d, sk_d
+
     async def _load_bs_snapshot(self) -> None:
         p = self._bs_path()
         if not p or not os.path.exists(p):
@@ -1235,10 +1350,18 @@ class Node:
                 data = json.load(f)
             for name, bs in (("local", self.local_bs), ("global", self.global_bs)):
                 for cell_hex, items in (data.get(name) or {}).items():
+                    lst = bs.setdefault(bytes.fromhex(cell_hex), [])
                     for rec in items:
-                        bs[bytes.fromhex(cell_hex)].append(
+                        lst.append(
                             {"v": bytes.fromhex(rec["v"]), "bits": int(rec["bits"]), "ts": float(rec["ts"])})
-            log_json(self.name, "info", "bs_loaded", path=p)
+            # сиды: рестарт обязан продолжать ту же цепочку (иначе emergency-
+            # публикация на текущих метках расходится с живой сетью).
+            # метки абсолютные (unix/rl) — frac/границы всюду от epoch.
+            for lbl, sh in (data.get("seeds") or {}).items():
+                self.seeds[int(lbl)] = bytes.fromhex(sh)
+            self.emergency = {int(x) for x in (data.get("emerg") or [])}
+            log_json(self.name, "info", "bs_loaded", path=p,
+                     seeds=len(self.seeds), ver=2)
         except Exception as e:
             log_json(self.name, "warn", "bs_load_fail", err=repr(e))
 
@@ -1247,7 +1370,14 @@ class Node:
         if not p:
             return
         try:
-            data = {"local": _bs_dump(self.local_bs), "global": _bs_dump(self.global_bs)}
+            data = {"ver": 2, "local": _bs_dump(self.local_bs),
+                    "global": _bs_dump(self.global_bs)}
+            if self.seeds:
+                keep = sorted(self.seeds)[-1024:]
+                data["seeds"] = {str(k): self.seeds[k].hex() for k in keep}
+                self.emergency = {n for n in self.emergency if n >= keep[0]}
+            if self.emergency:
+                data["emerg"] = sorted(self.emergency)[-64:]
             os.makedirs(self.cfg["data_dir"], exist_ok=True)
             tmp = p + ".tmp"
             with open(tmp, "w") as f:
@@ -1343,8 +1473,15 @@ class Node:
             "peer_conns": sum(1 for s in self.peer_conns.values() if not s.closed),
             "clients": sum(len(v) for v in self.online.values()),
             "sec_sessions": sum(1 for s in self.sessions.values() if s.sec),
-            "round": self.round_of_ts(now),
-            "seeds": {str(k): v.hex()[:16] for k, v in sorted(self.seeds.items())[-4:]},
+            "round": round_display(self.round_of_ts(now), self.cfg),
+            # unixtime старта «текущего» раунда (когда метка создана)
+            "round_ts":
+                self.round_of_ts(now) * self.cfg["round_len"]
+                + (W.GENESIS_TS if self.cfg["round_len"] == 10.0 else 0),
+            "seeds": {str(round_display(k, self.cfg)): {"seed": v.hex()[:16],
+                      "ts": int(k * self.cfg["round_len"]) +
+                            (W.GENESIS_TS if self.cfg["round_len"] == 10.0 else 0)}
+                      for k, v in sorted(self.seeds.items())[-4:]},
             "local_cells": len(self.local_bs),
             "global_cells": len(self.global_bs),
             "local_recs": sum(len(v) for v in self.local_bs.values()),
@@ -1375,6 +1512,7 @@ _HANDLERS = {
     W.F_PING: Node._h_ping,
     W.F_HELLO: Node._h_hello,
     W.F_SEED_REQ: Node._h_seed_req,
+    W.F_SEED: Node._h_seed_absorb,
     W.F_DIR_REQ: Node._h_dir_req,
     W.F_DIR: Node._h_dir,
     W.F_MIX_ONION: Node._h_mix,

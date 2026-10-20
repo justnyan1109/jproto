@@ -15,6 +15,12 @@ from __future__ import annotations
 import struct
 from typing import Iterable, NamedTuple, Sequence
 
+# Генсис сети: 2026-10-20 00:00 UTC. Внутренние метки раундов у нод —
+# абсолютные (⌊unix/10⌋); наружу (status//seed/F_SEED дисплей) метка
+# показывается сдвинутой на GENESIS_RND — «сколько раундов работает сеть».
+GENESIS_TS  = 1792454400
+GENESIS_RND = GENESIS_TS // 10            # N=0 на 00:00 20.10.2026
+
 # --- frame types (f-типы) ---------------------------------------------------
 F_HELLO            = 0x0001
 F_HELLO_OK         = 0x0002

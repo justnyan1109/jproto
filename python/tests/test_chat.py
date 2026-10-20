@@ -201,9 +201,15 @@ def test_stor_par_and_round_alignment(ids, tmp_path):
             assert sp["window_h"] == 48
             assert sp["n_active"] >= 1          # мы HELLO-зарегистрированы
             assert sp["retention_h"] > 0
-            # round = floor(unix/round_len) — привязка к стен-часу
-            n_now = node.round_of_ts(__import__("time").time())
-            assert abs(n_now * rl - __import__("time").time()) < 2 * rl
+            # внутренняя метка абсолютная (границы стен-часа по epoch);
+            # status наружу показывает сдвиг от генсиса («сколько раундов
+            # работает сеть», round_display при протокольном round_len=10)
+            t_now = __import__("time").time()
+            n_now = node.round_of_ts(t_now)
+            assert abs(n_now * rl - t_now) < 2 * rl
+            # наружная метка status — сдвиг от генсиса (протокольный rl=10)
+            if rl == 10.0:
+                assert abs(node.status()["round"] - (n_now - 179245440)) < 1
             if chat.round is not None:
                 assert chat.round <= n_now, "сид будущего раунда?"
                 hour = chat.round // 360

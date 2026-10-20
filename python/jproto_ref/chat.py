@@ -529,7 +529,8 @@ class ChatApp:
             self.out(HELP_TXT)
         elif c == "/me":
             self.out(f"  addr  {self.c.ident.addr.hex()}")
-            self.out(f"  node  {self.c.pin_key} secured, round={self.c.round}")
+            self.out(f"  node  {self.c.pin_key} secured, round={self.c.round - W.GENESIS_RND} "
+                     f"(unix={int(self.c.round * 10) + W.GENESIS_TS})")
             sp = self.c.stor_par
             if sp:
                 self.out(f"  stor  seff={sp['slots_lbs']} gbs={sp['slots_gbs']} "
@@ -541,7 +542,9 @@ class ChatApp:
                 mark = "*" if e["addr"] == self.c.node_addr else " "
                 self.out(f"  {i:2}{mark} {e['host']}:{e['port']:<5} {self._short(a)}")
         elif c == "/seed":
-            self.out(f"  round={self.c.round} seeds={list(self.c.seeds)}")
+            self.out(f"  round={self.c.round - W.GENESIS_RND} "
+                     f"(unix={int(self.c.round * 10) + W.GENESIS_TS}) "
+                     f"seeds={[(l - W.GENESIS_RND, int(l * 10) + W.GENESIS_TS) for l in self.c.seeds]}")
         elif c == "/to":
             spec, sep, home_s = rest.partition("@")
             pk, addr = _resolve_recipient(spec)
